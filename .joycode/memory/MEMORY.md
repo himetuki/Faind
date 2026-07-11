@@ -1,0 +1,1 @@
+- [path-priority-search](project_path_priority_search.md) — 路径优先搜索策略实现 - 搜索时先匹配路径/文件夹名再搜索单独文件
