@@ -10,9 +10,11 @@ Faind 结合 [Everything](https://www.voidtools.com/) 的极速文件索引与 A
 - **路径优先搜索** — 搜索时优先匹配路径/文件夹名，再搜索单独文件，大幅提升命中率
 - **文件标签系统** — 基于 SQLite 的标签管理
 - **深色/浅色主题** — 一键切换，设置自动持久化
-- **零浏览器依赖** — 基于 customtkinter 的原生桌面界面，无需 Chrome/WebView
+- **Fluent Design 界面** — 基于 PySide6 + qfluentwidgets 的现代化桌面界面，侧边栏导航
+- **零浏览器依赖** — 原生桌面应用，无需 Chrome/WebView
 - **零前置依赖** — 内嵌 Everything 便携版，启动时自动后台运行，无需用户单独安装
 - **便携分发** — 单 exe 文件，所有依赖内嵌，配置跟随 exe
+- **文档内容搜索** — 支持 PDF、Office、文本等格式的全文检索，可选 AI 内容总结
 
 ## 前置要求
 
@@ -73,14 +75,19 @@ AI 默认使用智谱 GLM-4.7-Flash，也可切换为任何 OpenAI 兼容 API。
 
 ```
 Faind/
-├── main.py              # 主入口
-├── gui.py               # customtkinter 界面
+├── main.py              # 主入口（PySide6 事件循环）
+├── gui.py               # PySide6 + qfluentwidgets FluentUI 界面
 ├── ai_parser.py         # AI 搜索 Agent
+├── ai_cache.py          # AI 缓存（避免重复请求）
+├── ai_response_logger.py # AI 响应日志
+├── content_reader.py    # 文档内容读取（PDF/Office/文本等）
 ├── everything_search.py # Everything 搜索封装（自动启动/停止内嵌 Everything）
 ├── tag_manager.py       # 标签管理（SQLite）
 ├── config.py            # 配置管理
+├── config.example.json  # 配置模板
 ├── Faind.spec           # PyInstaller 打包配置
 ├── build.bat            # 一键打包脚本
+├── build.ps1            # PowerShell 打包脚本
 ├── requirements.txt     # Python 依赖
 └── library/             # 外部依赖
     ├── Everything/      # Everything 便携版（MIT）— 自动后台运行
