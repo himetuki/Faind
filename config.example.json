@@ -1,4 +1,9 @@
 {
+  "search_engine": "auto",
+  "everything_service": {
+    "enabled": false
+  },
+  "first_launch_completed": false,
   "ai": {
     "provider": "GLM",
     "base_url": "https://api.deepseek.com",
@@ -12,6 +17,9 @@
     "dll_path": "",
     "use_es_cli": false,
     "es_cli_path": ""
+  },
+  "fd": {
+    "path": ""
   },
   "ui": {
     "max_results": 100,

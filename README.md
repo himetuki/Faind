@@ -2,12 +2,14 @@
 
 智能文件定位与标签系统 — 用自然语言找到你的文件。
 
-Faind 结合 [Everything](https://www.voidtools.com/) 的极速文件索引与 AI 语义理解，让你用自然语言描述即可精确定位文件，并为文件添加标签进行组织管理。
+Faind 结合 Everything SDK / [fd](https://github.com/sharkdp/fd) 的极速文件搜索与 AI 语义理解，让你用自然语言描述即可精确定位文件，并为文件添加标签进行组织管理。
 
 ## 特性
 
-- **自然语言搜索** — 输入"上周修改的PDF合同"，AI 自动解析为 Everything 查询语法
-- **路径优先搜索** — 搜索时优先匹配路径/文件夹名，再搜索单独文件，大幅提升命中率
+- **自然语言搜索** — 输入"上周在E盘修改的MD文件"，AI 自动解析为搜索查询
+- **多后端搜索** — 自动选择最优引擎：Everything SDK（DLL 直连）> fd CLI > ES CLI，支持热切换
+- **智能查询转换** — Everything 语法无损转换为 fd 参数（日期`dm:` → `--changed-within`，大小`size:` → `--size`，路径排除`!path:` → `-E`）
+- **路径优先搜索** — 搜索时优先匹配路径/文件夹名，搜索范围智能限定（"在E盘" → 仅搜 E:\）
 - **文件标签系统** — 基于 SQLite 的标签管理
 - **深色/浅色主题** — 一键切换，设置自动持久化
 - **Fluent Design 界面** — 基于 PySide6 + qfluentwidgets 的现代化桌面界面，侧边栏导航
@@ -22,6 +24,8 @@ Faind 结合 [Everything](https://www.voidtools.com/) 的极速文件索引与 A
 
 > Faind 已内嵌 Everything 便携版（MIT 许可），启动时自动在后台拉起，无需手动安装 Everything。
 > 首次启动时 Everything 会扫描磁盘建立索引（通常几十秒），后续启动即可秒搜。
+>
+> fd.exe 为可选的轻量替代引擎，无需索引，适合 Everything 不可用时的回退方案。
 
 ## 快速开始
 
@@ -44,6 +48,10 @@ pip install -r requirements.txt
 #    从 https://www.voidtools.com/downloads/ 下载 Everything Portable Zip x64
 #    解压后将 Everything64.exe 放到 library/Everything/ 目录下
 
+# 2a. (可选) 下载 fd
+#    从 https://github.com/sharkdp/fd/releases 下载 fd-vX.X.X-x86_64-pc-windows-msvc.zip
+#    解压后将 fd.exe 放到 library/fd/ 目录下
+
 # 3. 运行
 python main.py
 ```
@@ -64,8 +72,10 @@ pyinstaller Faind.spec --noconfirm
 
 | 配置域 | 说明 |
 |--------|------|
+| `search_engine` | 搜索后端：`auto`（自动选择）/ `fd`（fd CLI）/ `everything_dll`（SDK 直连）/ `everything_es`（ES CLI） |
 | `ai` | AI 提供商、API Key、模型等 |
 | `everything` | Everything SDK DLL / ES CLI 路径（留空则自动检测内置工具） |
+| `fd` | fd.exe 路径（留空则自动检测 `library/fd/fd.exe`） |
 | `ui` | 主题（Dark/Light）、最大结果数 |
 | `search_filters` | 排除文件夹、排序方式等 |
 
@@ -81,7 +91,7 @@ Faind/
 ├── ai_cache.py          # AI 缓存（避免重复请求）
 ├── ai_response_logger.py # AI 响应日志
 ├── content_reader.py    # 文档内容读取（PDF/Office/文本等）
-├── everything_search.py # Everything 搜索封装（自动启动/停止内嵌 Everything）
+├── everything_search.py # 多后端搜索封装（Everything DLL / fd CLI / ES CLI）
 ├── tag_manager.py       # 标签管理（SQLite）
 ├── config.py            # 配置管理
 ├── config.example.json  # 配置模板
@@ -90,6 +100,7 @@ Faind/
 ├── build.ps1            # PowerShell 打包脚本
 ├── requirements.txt     # Python 依赖
 └── library/             # 外部依赖
+    ├── fd/              # fd.exe （MIT）— 轻量替代引擎
     ├── Everything/      # Everything 便携版（MIT）— 自动后台运行
     ├── Everything-SDK/  # Everything SDK DLL（MIT）
     └── ES-1.1.0.30.x64/ # Everything ES CLI 工具（MIT）
@@ -113,6 +124,15 @@ Faind/
 > The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
 >
 > THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+### fd
+
+- 作者：David Peter (sharkdp)
+- 许可证：MIT License / Apache License 2.0（双许可）
+- 项目主页：https://github.com/sharkdp/fd
+- 源码位置：`library/fd/`
+
+> fd 是 Everything 不可用时的轻量替代引擎，支持正则匹配、文件类型过滤、日期/大小筛选等。
 
 ## 许可证
 

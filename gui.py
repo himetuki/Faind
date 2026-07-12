@@ -176,14 +176,18 @@ class SearchWorker(QThread):
         self.fast_mode = fast_mode
 
     def run(self):
+        if self.isInterruptionRequested():
+            return
         try:
             result = self.agent.process(self.query, fast_mode=self.fast_mode)
-            self.finished.emit(result)
+            if not self.isInterruptionRequested():
+                self.finished.emit(result)
         except Exception as e:
-            self.finished.emit({
-                "success": False, "results": [], "error": str(e),
-                "total": 0, "message": f"搜索异常: {e}"
-            })
+            if not self.isInterruptionRequested():
+                self.finished.emit({
+                    "success": False, "results": [], "error": str(e),
+                    "total": 0, "message": f"搜索异常: {e}"
+                })
 
 
 class ContentSearchWorker(QThread):
@@ -209,7 +213,8 @@ class ContentSearchWorker(QThread):
             content_results = None
             if not (self.content_reader_enabled and self.content_reader
                     and self.search_results):
-                self.content_ready.emit([])
+                if not self.isInterruptionRequested():
+                    self.content_ready.emit([])
                 return
 
             cr_cfg = config.load_config().get('content_reader', {})
@@ -219,6 +224,8 @@ class ContentSearchWorker(QThread):
             file_paths = [item.get('full_path', '') for item in self.search_results[:top_n]
                           if item.get('full_path', '')]
             file_contents = self._read_files_parallel(file_paths, max_chars)
+            if self.isInterruptionRequested():
+                return
 
             if file_contents and self.ai_summary_enabled:
                 content_results = self.agent.analyze_file_contents(file_contents, self.query)
@@ -233,16 +240,21 @@ class ContentSearchWorker(QThread):
                         'snippet': snippet if len(snippet) >= 50 else txt[:200]
                     })
 
+            if self.isInterruptionRequested():
+                return
+
             if content_results:
                 if self.not_relevant_cache and self.last_query:
                     blocked = self.not_relevant_cache.get_blocked_paths(self.last_query)
                     content_results = [r for r in content_results
                                        if r.get('file_path', '').replace('\\', '/') not in blocked]
 
-            self.content_ready.emit(content_results or [])
+            if not self.isInterruptionRequested():
+                self.content_ready.emit(content_results or [])
         except Exception as e:
             logger.error(f"内容搜索失败: {e}")
-            self.content_ready.emit([])
+            if not self.isInterruptionRequested():
+                self.content_ready.emit([])
 
     def _read_files_parallel(self, file_paths, max_chars):
         from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -507,6 +519,8 @@ class SearchInterface(QWidget):
         self._ai_response_height = 140
         self._last_search_result = {}
         self._last_query = ""
+        self._search_worker = None
+        self._content_worker = None
 
         self._setup_ui()
 
@@ -537,6 +551,27 @@ class SearchInterface(QWidget):
         search_btn.setFixedSize(80, 40)
         search_btn.clicked.connect(self._perform_search)
         search_box.addWidget(search_btn)
+
+        self.cancel_btn = TransparentPushButton("终止")
+        self.cancel_btn.setFixedSize(60, 40)
+        self.cancel_btn.setStyleSheet("""
+            QPushButton {
+                color: #e74c3c;
+                border: 1px solid #e74c3c;
+                border-radius: 5px;
+                font-weight: bold;
+                background: rgba(231, 76, 60, 0.08);
+            }
+            QPushButton:hover {
+                background: rgba(231, 76, 60, 0.2);
+            }
+            QPushButton:pressed {
+                background: rgba(231, 76, 60, 0.35);
+            }
+        """)
+        self.cancel_btn.clicked.connect(self._cancel_search)
+        self.cancel_btn.hide()
+        search_box.addWidget(self.cancel_btn)
 
         search_layout.addLayout(search_box)
 
@@ -735,6 +770,47 @@ class SearchInterface(QWidget):
                 return True
         return super().eventFilter(obj, event)
 
+    def _cancel_search(self):
+        """终止当前搜索任务"""
+        if not self._is_searching:
+            return
+
+        print("[SearchInterface] 用户终止搜索")
+        self._is_searching = False
+        self.search_input.setEnabled(True)
+        self.cancel_btn.hide()
+
+        # 通知搜索 worker 中断
+        if self._search_worker and self._search_worker.isRunning():
+            self._search_worker.requestInterruption()
+            try:
+                self._search_worker.finished.disconnect(self._on_search_finished)
+            except (TypeError, RuntimeError):
+                pass
+            # 给线程一点时间自行退出，否则强制终止
+            if not self._search_worker.wait(200):
+                self._search_worker.terminate()
+                self._search_worker.wait(500)
+
+        # 通知内容搜索 worker 中断
+        if self._content_worker and self._content_worker.isRunning():
+            self._content_worker.requestInterruption()
+            try:
+                self._content_worker.content_ready.disconnect(self._append_content_results)
+            except (TypeError, RuntimeError):
+                pass
+            if not self._content_worker.wait(200):
+                self._content_worker.terminate()
+                self._content_worker.wait(500)
+
+        self._search_worker = None
+        self._content_worker = None
+
+        # 清空搜索中的加载提示，恢复结果区
+        self._clear_results()
+        self.results_count_label.setText("已终止")
+        InfoBar.info(title="搜索", content="搜索已终止", parent=self, duration=2000)
+
     def _perform_search(self):
         if self._is_searching:
             return
@@ -764,6 +840,7 @@ class SearchInterface(QWidget):
         self._results_layout.addWidget(loading)
 
         self.search_input.setEnabled(False)
+        self.cancel_btn.show()
 
         # 启动搜索线程
         fast_mode = self._fast_search_enabled
@@ -774,6 +851,7 @@ class SearchInterface(QWidget):
     def _on_search_finished(self, result):
         self._is_searching = False
         self.search_input.setEnabled(True)
+        self.cancel_btn.hide()
         self._last_search_result = result
 
         # 批量查询标签
@@ -1702,8 +1780,44 @@ class SettingsInterface(QWidget):
         ai_cards.addWidget(self._make_edit_card("模型", self.model_edit))
         container_layout.addWidget(ai_group)
 
+        # ===== 搜索引擎选择 =====
+        search_group, search_cards = self._make_group("🔍 搜索引擎")
+        self.search_engine_combo = ComboBox()
+        self.search_engine_combo.addItems(["自动（优先 fd）", "fd（轻量，无需后台服务）", "Everything SDK", "Everything ES.exe"])
+        engine_choice = cfg.get('search_engine', 'auto')
+        idx_map = {"auto": 0, "fd": 1, "everything_dll": 2, "everything_es": 3}
+        self.search_engine_combo.setCurrentIndex(idx_map.get(engine_choice, 0))
+        search_cards.addWidget(self._make_edit_card("搜索后端", self.search_engine_combo))
+        container_layout.addWidget(search_group)
+
+        # ===== Everything 服务 =====
+        evsvc_group, evsvc_cards = self._make_group("⚡ Everything 服务")
+        evsvc_enabled = cfg.get('everything_service', {}).get('enabled', False)
+        self._evsvc_enabled_card, self._evsvc_enabled_switch = self._make_switch_card(
+            FluentIcon.ROBOT, "启用 Everything 内部服务",
+            "Everything 随 Faind 启动；扫描期间使用 fd 过渡", evsvc_enabled)
+        evsvc_cards.addWidget(self._evsvc_enabled_card)
+
+        # 手动控制按钮 + 状态
+        ev_control_card = SimpleCardWidget()
+        ev_control_layout = QHBoxLayout(ev_control_card)
+        ev_control_layout.setContentsMargins(16, 8, 16, 8)
+        ev_control_layout.setSpacing(12)
+        self.ev_status_label = BodyLabel("Everything 状态: ---")
+        ev_control_layout.addWidget(self.ev_status_label)
+        ev_control_layout.addStretch()
+        self.ev_start_btn = PrimaryPushButton("启动 Everything")
+        self.ev_start_btn.setFixedWidth(150)
+        self.ev_start_btn.clicked.connect(self._toggle_everything_service)
+        ev_control_layout.addWidget(self.ev_start_btn)
+        evsvc_cards.addWidget(ev_control_card)
+        container_layout.addWidget(evsvc_group)
+
+        # 连接开关信号，实时更新按钮状态
+        self._evsvc_enabled_switch.checkedChanged.connect(self._on_evsvc_switch_changed)
+
         # ===== Everything 设置 =====
-        ev_group, ev_cards = self._make_group("🔍 Everything 设置")
+        ev_group, ev_cards = self._make_group("⚙ Everything 后端设置")
         self.dll_path_edit = LineEdit()
         self.dll_path_edit.setText(cfg.get('everything', {}).get('dll_path', ''))
         self.dll_path_edit.setPlaceholderText("留空自动检测")
@@ -1789,6 +1903,14 @@ class SettingsInterface(QWidget):
         self._log_timer.timeout.connect(self._refresh_log)
         self._log_timer.start(1000)
 
+        # Everything 状态刷新
+        self._ev_status_timer = QTimer(self)
+        self._ev_status_timer.timeout.connect(self._refresh_everything_status)
+        self._ev_status_timer.start(2000)
+
+        # 首次刷新状态
+        QTimer.singleShot(500, self._refresh_everything_status)
+
     def _make_edit_card(self, title, edit):
         card = SimpleCardWidget()
         card_layout = QVBoxLayout(card)
@@ -1816,12 +1938,145 @@ class SettingsInterface(QWidget):
     def _refresh_log(self):
         capture = LogCapture()
         new_text = capture.get_text(tail=200)
-        if new_text:
-            self.log_text.setPlainText(new_text)
+        if not new_text:
+            return
+
+        # 保存滚动位置，避免刷新后跳回顶端
+        v_scroll = self.log_text.verticalScrollBar()
+        was_at_bottom = v_scroll.maximum() > 0 and v_scroll.value() >= v_scroll.maximum()
+        old_ratio = v_scroll.value() / max(v_scroll.maximum(), 1)
+
+        self.log_text.setPlainText(new_text)
+
+        if was_at_bottom or not hasattr(self, '_log_initial_scroll_done'):
+            # 用户在底部 → 自动跟随末尾；首次加载也滚到底部
+            v_scroll.setValue(v_scroll.maximum())
+            self._log_initial_scroll_done = True
+        elif old_ratio > 0:
+            # 用户手动上翻查看历史 → 按比例还原滚动位置
+            new_val = int(old_ratio * v_scroll.maximum())
+            v_scroll.setValue(max(new_val - 1, 0))
+
+    def _refresh_everything_status(self):
+        """刷新 Everything 服务状态显示"""
+        win = self._window
+        if not win or not win.search_engine:
+            return
+
+        engine = win.search_engine
+        status = engine.get_everything_status()
+
+        detail = engine.get_status_detail()
+        started_by_us = detail.get('started_by_us', False)
+
+        status_map = {
+            'not_enabled': ('未启用', '🔴'),
+            'not_started': ('未启动', '🔴'),
+            'starting': ('启动中...', '🟡'),
+            'scanning': ('扫描中', '🟡'),
+            'working': ('正在工作', '🟢'),
+            'error': ('错误', '⛔'),
+        }
+        label, icon = status_map.get(status, ('未知', '❓'))
+
+        # 标注 Everything 来源：本地（用户安装） 或 内部（内嵌便携版）
+        source = ''
+        if status in ('working', 'scanning', 'starting'):
+            if started_by_us:
+                source = ' [内部]'
+            else:
+                source = ' [本地]'
+        self.ev_status_label.setText(f"Everything 状态: {icon} {label}{source}")
+
+        # 更新按钮文字和状态
+        if status == 'not_enabled':
+            self.ev_start_btn.setText("启动 Everything")
+            self.ev_start_btn.setEnabled(False)
+        elif status == 'not_started':
+            self.ev_start_btn.setText("启动 Everything")
+            self.ev_start_btn.setEnabled(True)
+        elif status in ('starting', 'scanning'):
+            self.ev_start_btn.setText("停止 Everything")
+            self.ev_start_btn.setEnabled(True)
+        elif status == 'working':
+            self.ev_start_btn.setText("重启 Everything")
+            self.ev_start_btn.setEnabled(True)
+        elif status == 'error':
+            self.ev_start_btn.setText("重试 Everything")
+            self.ev_start_btn.setEnabled(True)
+
+    def _on_evsvc_switch_changed(self, checked):
+        """Everything 服务开关切换"""
+        win = self._window
+        if not win or not win.search_engine:
+            return
+        engine = win.search_engine
+        engine.everything_service_enabled = checked
+        self._refresh_everything_status()
+
+    def _toggle_everything_service(self):
+        """手动启动/停止/重启 Everything 服务"""
+        win = self._window
+        if not win or not win.search_engine:
+            return
+
+        engine = win.search_engine
+        status = engine.get_everything_status()
+
+        if status == 'not_started':
+            # 启动
+            if not engine.everything_service_enabled:
+                engine.everything_service_enabled = True
+                self._evsvc_enabled_switch.setChecked(True)
+            success = engine.start_everything_service()
+            if success:
+                InfoBar.success(
+                    title="Everything",
+                    content="Everything 服务正在启动，扫描完成前使用 fd 搜索",
+                    parent=self,
+                    duration=4000
+                )
+            else:
+                InfoBar.error(title="Everything", content="启动失败，请检查 library/Everything/ 下是否有 Everything.exe 或 Everything64.exe", parent=self)
+        elif status in ('starting', 'scanning'):
+            # 停止
+            engine._stop_monitoring()
+            engine.shutdown()
+            engine._everything_status = 'not_started'
+            engine._transitional = False
+            engine._use_fd = True
+            engine._index_ready = True
+            InfoBar.info(title="Everything", content="Everything 服务已停止，当前使用 fd 搜索", parent=self)
+        elif status == 'working':
+            # 重启
+            engine.shutdown()
+            engine._everything_status = 'not_started'
+            engine._transitional = True
+            engine._use_fd = True
+            engine._index_ready = True
+            if not engine.everything_service_enabled:
+                engine.everything_service_enabled = True
+            engine.start_everything_service()
+            InfoBar.info(title="Everything", content="正在重启 Everything 服务...", parent=self)
+        elif status == 'error':
+            # 重试
+            engine._everything_status = 'not_started'
+            engine._transitional = True
+            engine._use_fd = True
+            engine._index_ready = True
+            engine.start_everything_service()
+            InfoBar.info(title="Everything", content="正在重试启动 Everything...", parent=self)
+        self._refresh_everything_status()
 
     def _save_settings(self):
         win = self._window
         new_cfg = {
+            'search_engine': {"auto": "auto", "fd": "fd", "everything_dll": "everything_dll", "everything_es": "everything_es"}.get(
+                {0: "auto", 1: "fd", 2: "everything_dll", 3: "everything_es"}.get(self.search_engine_combo.currentIndex(), "auto"), "auto"
+            ),
+            'everything_service': {
+                'enabled': self._evsvc_enabled_switch.isChecked(),
+            },
             'ai': {
                 'enabled': self._ai_enabled_switch.isChecked(),
                 'base_url': self.base_url_edit.text().strip(),
@@ -1870,7 +2125,38 @@ class SettingsInterface(QWidget):
 
             win._search_filters = new_cfg['search_filters']
 
-        InfoBar.success(title="成功", content="配置已保存", parent=self)
+        engine_changed = new_cfg.get('search_engine', 'auto') != config.get_config_value('search_engine', 'auto')
+        evsvc_changed = new_cfg.get('everything_service', {}).get('enabled') != config.get_config_value('everything_service.enabled', False)
+
+        # 应用 Everything 服务设置到运行时
+        if win and win.search_engine:
+            win.search_engine.everything_service_enabled = new_cfg.get('everything_service', {}).get('enabled', False)
+            # 如果启用了服务且尚未就绪，触发启动/检测
+            if new_cfg.get('everything_service', {}).get('enabled', False):
+                win.search_engine.ensure_everything_running()
+
+        messages = []
+        if engine_changed:
+            messages.append("搜索后端")
+        if evsvc_changed:
+            messages.append("Everything 服务")
+
+        if engine_changed:
+            InfoBar.warning(
+                title="搜索后端已更改",
+                content="重启 Faind 后生效",
+                parent=self,
+                duration=5000
+            )
+        elif messages and evsvc_changed:
+            InfoBar.success(
+                title="Everything 服务设置已更新",
+                content="新的设置已生效",
+                parent=self,
+                duration=3000
+            )
+        else:
+            InfoBar.success(title="成功", content="配置已保存", parent=self)
 
 
 # ============ 主窗口 ============
@@ -1945,13 +2231,22 @@ class FaindWindow(FluentWindow):
         if not self.search_engine or not self.search_engine._initialized:
             return
 
+        # fd 模式无需索引，直接标记就绪
+        if self.search_engine._use_fd:
+            self._on_index_ready(True)
+            return
+
         self.worker = IndexWaitWorker(self.search_engine, timeout=180)
         self.worker.finished.connect(self._on_index_ready)
         self.worker.start()
 
     def _on_index_ready(self, ok):
         if ok:
-            print("[Faind] Everything 索引就绪")
+            backend = self.search_engine.get_status_detail().get("backend", "")
+            if backend == "fd":
+                print("[Faind] fd 搜索后端就绪（无需索引）")
+            else:
+                print("[Faind] Everything 索引就绪")
         else:
             print("[Faind] 警告: 索引建立超时，搜索结果可能不完整")
         self.check_status()
