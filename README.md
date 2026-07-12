@@ -8,7 +8,7 @@ Faind 结合 [Everything](https://www.voidtools.com/) 的极速文件索引与 A
 
 - **自然语言搜索** — 输入"上周修改的PDF合同"，AI 自动解析为 Everything 查询语法
 - **路径优先搜索** — 搜索时优先匹配路径/文件夹名，再搜索单独文件，大幅提升命中率
-- **文件标签系统** — 基于 SQLite 的标签管理，支持 TMSU 双向同步
+- **文件标签系统** — 基于 SQLite 的标签管理
 - **深色/浅色主题** — 一键切换，设置自动持久化
 - **零浏览器依赖** — 基于 customtkinter 的原生桌面界面，无需 Chrome/WebView
 - **便携分发** — 单 exe 文件，所有依赖内嵌，配置跟随 exe
@@ -53,7 +53,6 @@ pyinstaller Faind.spec --noconfirm
 |--------|------|
 | `ai` | AI 提供商、API Key、模型等 |
 | `everything` | Everything SDK DLL / ES CLI 路径 |
-| `tmsu` | TMSU 可执行文件和数据库路径 |
 | `ui` | 主题（Dark/Light）、最大结果数 |
 | `search_filters` | 排除文件夹、排序方式等 |
 
@@ -67,15 +66,14 @@ Faind/
 ├── gui.py               # customtkinter 界面
 ├── ai_parser.py         # AI 搜索 Agent
 ├── everything_search.py # Everything 搜索封装
-├── tag_manager.py       # 标签管理（SQLite + TMSU）
+├── tag_manager.py       # 标签管理（SQLite）
 ├── config.py            # 配置管理
 ├── Faind.spec           # PyInstaller 打包配置
 ├── build.bat            # 一键打包脚本
 ├── requirements.txt     # Python 依赖
 └── library/             # 外部依赖
     ├── Everything-SDK/  # Everything SDK（MIT）
-    ├── ES-1.1.0.30.x64/ # Everything ES CLI 工具
-    └── tmsu/            # TMSU（GPL v3）
+    └── ES-1.1.0.30.x64/ # Everything ES CLI 工具
 ```
 
 ## 致谢与开源许可
@@ -97,18 +95,7 @@ Faind/
 >
 > THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-### TMSU
-
-- 作者：oniony
-- 许可证：GNU General Public License v3.0
-- 项目主页：https://github.com/oniony/TMSU
-- 源码位置：`library/tmsu/`
-- 完整许可证文本：`library/tmsu/COPYING.md`
-
-> TMSU is licensed under the GNU General Public License version 3.
-
 ## 许可证
 
-由于本项目包含 TMSU（GPL v3）的组件，根据 GPL v3 的 copyleft 条款，**Faind 整体以 GNU General Public License v3.0 发布**。
+Faind 以 MIT License 发布，详见 [LICENSE](LICENSE) 文件。
 
-详见 [LICENSE](LICENSE) 文件。
