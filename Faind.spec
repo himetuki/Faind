@@ -31,20 +31,23 @@ if _try_import_certifi():
     import certifi as _certifi
     CERTIFI_DATAS = [(str(Path(_certifi.__file__).parent / 'cacert.pem'), 'certifi')]
 
+FD_DATAS = []
+_fd_dir = ROOT / 'library' / 'fd'
+if _fd_dir.exists():
+    FD_DATAS = [(str(_fd_dir), 'library/fd')]
+
 a = Analysis(
     [str(ROOT / 'main.py')],
     pathex=[str(ROOT)],
     binaries=[],
     datas=[
-        # fd 搜索后端（默认，轻量无依赖）
-        (str(ROOT / 'library' / 'fd'), 'library/fd'),
         # Everything SDK DLL（运行时必需）
         (str(ROOT / 'library' / 'Everything-SDK' / 'dll' / 'Everything64.dll'), 'library/Everything-SDK/dll'),
         # ES CLI（DLL降级备用）
         (str(ROOT / 'library' / 'ES-1.1.0.30.x64'), 'library/ES-1.1.0.30.x64'),
         # 内嵌 Everything 便携版（确保后台无安装也能搜索）
         (str(ROOT / 'library' / 'Everything'), 'library/Everything'),
-    ] + CERTIFI_DATAS,
+    ] + FD_DATAS + CERTIFI_DATAS,
     hiddenimports=[
         'PySide6',
         'qfluentwidgets',
