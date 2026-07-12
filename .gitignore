@@ -30,8 +30,7 @@ config.json
 _test_*.py
 _test_*.txt
 
-# fd 搜索引擎（需单独下载，参考 README）
-library/fd/
+# fd 搜索引擎 — 已纳入版本控制，CI 打包时随 exe 发布
 
 # 旧文件归档（测试脚本、开发文档、日志）
 old/

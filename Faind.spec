@@ -31,20 +31,39 @@ if _try_import_certifi():
     import certifi as _certifi
     CERTIFI_DATAS = [(str(Path(_certifi.__file__).parent / 'cacert.pem'), 'certifi')]
 
+
+def _collect_library_datas():
+    """收集 library/ 下的 datas，缺少的目录自动跳过（CI 环境容错）。"""
+    datas = []
+
+    # fd 搜索后端（可选，CI 环境/用户本地可能未下载）
+    fd_path = ROOT / 'library' / 'fd'
+    if fd_path.exists():
+        datas.append((str(fd_path), 'library/fd'))
+
+    # Everything SDK DLL（运行时必需）
+    dll_path = ROOT / 'library' / 'Everything-SDK' / 'dll' / 'Everything64.dll'
+    if dll_path.exists():
+        datas.append((str(dll_path), 'library/Everything-SDK/dll'))
+
+    # ES CLI（DLL降级备用）
+    es_path = ROOT / 'library' / 'ES-1.1.0.30.x64'
+    if es_path.exists():
+        datas.append((str(es_path), 'library/ES-1.1.0.30.x64'))
+
+    # 内嵌 Everything 便携版
+    everything_path = ROOT / 'library' / 'Everything'
+    if everything_path.exists():
+        datas.append((str(everything_path), 'library/Everything'))
+
+    return datas
+
+
 a = Analysis(
     [str(ROOT / 'main.py')],
     pathex=[str(ROOT)],
     binaries=[],
-    datas=[
-        # fd 搜索后端（默认，轻量无依赖）
-        (str(ROOT / 'library' / 'fd'), 'library/fd'),
-        # Everything SDK DLL（运行时必需）
-        (str(ROOT / 'library' / 'Everything-SDK' / 'dll' / 'Everything64.dll'), 'library/Everything-SDK/dll'),
-        # ES CLI（DLL降级备用）
-        (str(ROOT / 'library' / 'ES-1.1.0.30.x64'), 'library/ES-1.1.0.30.x64'),
-        # 内嵌 Everything 便携版（确保后台无安装也能搜索）
-        (str(ROOT / 'library' / 'Everything'), 'library/Everything'),
-    ] + CERTIFI_DATAS,
+    datas=_collect_library_datas() + CERTIFI_DATAS,
     hiddenimports=[
         'PySide6',
         'qfluentwidgets',
