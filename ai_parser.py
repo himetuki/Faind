@@ -5,12 +5,17 @@ Faind 搜索 Agent 模块
 """
 
 import json
+import logging
 import os
 import re
 import sys
 from typing import Optional
 
 import config
+from ai_cache import AICache
+from ai_response_logger import AIRequestLogger
+
+logger = logging.getLogger(__name__)
 
 
 def _ensure_ssl_certs():
@@ -73,6 +78,26 @@ AGENT_SYSTEM_PROMPT = """你是 Faind 文件搜索助手，一个智能文件管
 - 错误示例：搜索 "Candydoll" 只用关键词匹配文件名 → 只返回1个结果
 - 正确示例：搜索 "Candydoll" 用 path:Candydoll → 返回路径匹配的完整结果
 - 规则：人名/主题/系列/品牌 等关键词一律用 path: 搜索
+
+## 无结果重试策略（重要！）
+如果 search_files 返回 0 个结果，绝不要直接放弃！必须尝试以下策略：
+- 使用同义词、近义词、相关词汇重新搜索
+- 放宽搜索条件（去掉部分限制、使用更宽泛的关键词）
+- 尝试不同的 Everything 语法表达（如 path:关键词 改用直接关键词，或反过来）
+- 最多尝试3轮不同的搜索策略，直到找到文件或确认确实不存在
+
+## 内容搜索流程（用户要求查找包含特定内容的文件时）
+当用户意图涉及文件**内容**（如"包含XXX的资料"、"关于XXX的文档"），必须遵循两阶段流程：
+
+### 第一阶段：文件名/路径搜索
+1. 调用 search_files 按文件名和路径搜索，获取候选文件列表
+2. 向用户报告第一轮搜索找到了多少候选文件
+
+### 第二阶段：内容验证与筛选
+1. 从第一轮结果中选取最相关的文件（建议前15个），调用 read_file_contents 读取其实际内容
+2. 仔细对比每个文件的内容与用户搜索意图，判断是否真正相关
+3. **重要**：只保留内容真正匹配的文件！文件名匹配但内容无关的要排除
+4. 最终回复中明确指出哪些文件通过了内容验证，哪些被排除了
 
 ## 标签提取规则
 - "把这些标记为重要项目" → tags: ["重要", "项目"]
@@ -219,6 +244,24 @@ TOOLS = [
                 "required": ["file_info"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file_contents",
+            "description": "读取文件的文本内容。用于内容搜索第二阶段：在文件名匹配后，读取候选文件的实际内容来判断是否与用户意图真正相关。支持 PDF、DOCX、XLSX、PPTX、TXT、MD 等格式。每次建议读取不超过15个文件。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_paths": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "要读取内容的文件完整路径列表，建议每次不超过15个"
+                    }
+                },
+                "required": ["file_paths"]
+            }
+        }
     }
 ]
 
@@ -253,13 +296,15 @@ DATE_MAP = {
 class SearchAgent:
     """文件搜索 Agent — 使用 AI tool calling 进行智能搜索与标签管理"""
 
-    def __init__(self, search_engine=None, tag_manager=None):
+    def __init__(self, search_engine=None, tag_manager=None, content_reader=None):
         self.search_engine = search_engine
         self.tag_manager = tag_manager
+        self.content_reader = content_reader
         self.client = None
         self.model = "gpt-4o-mini"
         self.max_tokens = 1500
         self.temperature = 0.2
+        self.cache = AICache()
         self._init_ai_client()
 
     def _init_ai_client(self):
@@ -297,28 +342,79 @@ class SearchAgent:
 
     # ============ Agent 主循环 ============
 
-    def process(self, user_input: str, context: dict = None) -> dict:
+    def process(self, user_input: str, context: dict = None, fast_mode: bool = True) -> dict:
         """
         Agent 主入口：处理用户输入
         :param user_input: 用户自然语言输入
         :param context: 上下文 {"selected_files": [...]}
-        :return: 统一结果 {"success", "results", "error", "total", "message", "actions"}
+        :param fast_mode: True=简单搜索（跳过AI，规则转查询），False=AI智能搜索
+        :return: 统一结果 {"success", "results", "error", "total", "message", "actions",
+                           "content_results": [...]}
         """
         user_input = user_input.strip()
         if not user_input:
             return {"success": False, "results": [], "error": "输入为空", "total": 0, "message": ""}
+
+        selected_files = (context or {}).get("selected_files", [])
+        is_tagging = any(kw in user_input for kw in ['标记', '添加标签', '打标签', '归类', '标签',
+                                                       '删除标签', '移除标签', '去掉标签'])
 
         # 先尝试规则匹配快速路径（标签操作等明确意图）
         quick_result = self._quick_match(user_input, context)
         if quick_result:
             return quick_result
 
+        # 简单搜索模式：跳过 AI，直接用规则转 Everything 语法搜索
+        if fast_mode and not selected_files and not is_tagging:
+            return self._fast_search(user_input)
+
         # AI Agent 模式
+        req_log = None
         if self.ai_available:
             try:
-                return self._agent_loop(user_input, context)
+                req_log = AIRequestLogger(user_input, fast_mode=False)
+
+                # 缓存逻辑：仅搜索、无上下文、非打标时查询缓存
+                if not selected_files and not is_tagging:
+                    cached = self.cache.get(user_input)
+                    if cached:
+                        logger.info(f"缓存命中: {user_input}")
+                        result = self._agent_loop(user_input, context, skip_ai=json.dumps(cached, ensure_ascii=False))
+                        req_log.log_search_result(
+                            success=result.get('success', False),
+                            total=result.get('total', 0),
+                            message=result.get('message', ''),
+                            cached=True
+                        )
+                        return result
+
+                result = self._agent_loop(user_input, context, req_logger=req_log)
+
+                # 搜索结果写入缓存
+                if not selected_files and not is_tagging and result.get('success'):
+                    cache_data = {
+                        'action': 'search',
+                        'message': result.get('message', ''),
+                    }
+                    actions = result.get('actions', [])
+                    for a in actions:
+                        if a.get('tool') == 'search_files':
+                            cache_data['everything_query'] = a.get('args', {}).get('query', '')
+                    self.cache.set(user_input, cache_data)
+
+                req_log.log_search_result(
+                    success=result.get('success', False),
+                    total=result.get('total', 0),
+                    error=result.get('error', ''),
+                    message=result.get('message', '')
+                )
+                return result
             except Exception as e:
-                print(f"[SearchAgent] Agent 异常，降级到规则搜索: {e}")
+                error_msg = str(e)
+                print(f"[SearchAgent] Agent 异常，降级到规则搜索: {error_msg}")
+                if req_log:
+                    req_log.log_api_error(0, error_msg, "Agent异常")
+                    req_log.log_search_result(success=False, total=0, error=error_msg)
 
         # 规则降级：纯搜索
         query = self._build_everything_query(user_input)
@@ -328,10 +424,43 @@ class SearchAgent:
             return result
         return {"success": False, "results": [], "error": "搜索引擎不可用", "total": 0, "message": ""}
 
-    def _agent_loop(self, user_input: str, context: dict = None, max_iterations: int = 6) -> dict:
+    def _agent_loop(self, user_input: str, context: dict = None, max_iterations: int = 6,
+                     skip_ai: str = None, req_logger=None, api_timeout: int = 30) -> dict:
         """
         Agent 循环：AI 推理 → 调用工具 → 观察结果 → 继续推理或结束
+        :param skip_ai: 缓存命中的 JSON 字符串，跳过 AI 直接执行工具调用
+        :param req_logger: AIRequestLogger 实例，用于记录交互日志
+        :param api_timeout: 单次 API 调用超时秒数
         """
+        # 缓存命中：直接用缓存的 tool call 执行搜索
+        if skip_ai:
+            try:
+                cached = json.loads(skip_ai)
+                query = cached.get('everything_query', '')
+                if query:
+                    final_result = {"success": False, "results": [], "total": 0,
+                                    "message": cached.get('message', ''),
+                                    "actions": [], "content_results": [],
+                                    "from_cache": True}
+                    if self.search_engine:
+                        if req_logger:
+                            req_logger.log_tool_execution(
+                                "search_files",
+                                {"query": query},
+                                "缓存命中，直接搜索"
+                            )
+                        search_result = self.search_engine.search(query)
+                        final_result["success"] = search_result.get("success", True)
+                        final_result["results"] = search_result.get("results", [])
+                        final_result["total"] = search_result.get("total", 0)
+                        final_result["actions"].append({
+                            "tool": "search_files",
+                            "args": {"query": query},
+                            "result_summary": f"搜索到 {final_result['total']} 个文件"
+                        })
+                    return final_result
+            except json.JSONDecodeError:
+                pass
         messages = [{"role": "system", "content": AGENT_SYSTEM_PROMPT}]
 
         # 构造用户消息
@@ -345,26 +474,72 @@ class SearchAgent:
 
         messages.append({"role": "user", "content": user_msg})
 
-        final_result = {"success": False, "results": [], "error": "", "total": 0, "message": "", "actions": []}
+        final_result = {"success": False, "results": [], "error": "", "total": 0, "message": "", "actions": [], "content_results": []}
+        read_contents = {}  # 跟踪 read_file_contents 读取到的内容
 
         for iteration in range(max_iterations):
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                tools=TOOLS,
-                temperature=self.temperature,
-                max_tokens=self.max_tokens,
-            )
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    tools=TOOLS,
+                    temperature=self.temperature,
+                    max_tokens=self.max_tokens,
+                    timeout=api_timeout,
+                )
+            except Exception as api_err:
+                error_msg = f"API 调用失败(第{iteration}轮): {api_err}"
+                logger.error(error_msg)
+                if req_logger:
+                    req_logger.log_api_error(iteration, str(api_err), "API调用异常")
+                final_result["error"] = error_msg
+                # 如果已有搜索结果，返回部分结果
+                if final_result.get("results"):
+                    final_result["success"] = True
+                    final_result["message"] = f"搜索到 {final_result.get('total', 0)} 个结果（AI 请求中断）"
+                else:
+                    final_result["message"] = f"AI 服务暂时不可用: {api_err}"
+                break
 
             choice = response.choices[0]
             message = choice.message
+            finish_reason = choice.finish_reason or ""
+
+            # 记录 API 调用日志
+            if req_logger:
+                tool_names = [tc.function.name for tc in message.tool_calls] if message.tool_calls else []
+                usage = {
+                    "prompt_tokens": response.usage.prompt_tokens if response.usage else "?",
+                    "completion_tokens": response.usage.completion_tokens if response.usage else "?",
+                    "total_tokens": response.usage.total_tokens if response.usage else "?"
+                } if response.usage else None
+                content_preview = message.content[:200] if message.content else ""
+                req_logger.log_api_request(
+                    iteration, self.model,
+                    f"系统提示词 + {len(messages)}条消息",
+                    len(message.tool_calls) if message.tool_calls else 0
+                )
+                req_logger.log_api_response(
+                    iteration,
+                    has_tool_calls=bool(message.tool_calls),
+                    tool_names=tool_names,
+                    content=message.content or "",
+                    finish_reason=finish_reason,
+                    usage=usage
+                )
 
             # 没有工具调用 → Agent 给出最终回复
             if not message.tool_calls:
-                final_result["message"] = message.content or ""
-                # 如果到这一步还没有搜索结果，标记为对话回复
+                # 如果还没有搜索结果，提示 AI 必须调用 search_files
                 if not final_result.get("results"):
-                    final_result["success"] = True
+                    messages.append(message)
+                    messages.append({
+                        "role": "user",
+                        "content": "你还没有调用 search_files 搜索文件！用户需要的是文件搜索结果，请先使用 search_files 工具搜索相关文件，然后再给出回复。"
+                    })
+                    continue
+                final_result["message"] = message.content or ""
+                final_result["success"] = True
                 break
 
             # 处理工具调用
@@ -379,19 +554,32 @@ class SearchAgent:
 
                 # 执行工具
                 tool_result = self._execute_tool(func_name, func_args)
+                result_summary = self._summarize_tool_result(func_name, tool_result)
+
+                # 记录工具执行日志
+                if req_logger:
+                    req_logger.log_tool_execution(func_name, func_args, result_summary)
 
                 # 记录动作
                 final_result["actions"].append({
                     "tool": func_name,
                     "args": func_args,
-                    "result_summary": self._summarize_tool_result(func_name, tool_result)
+                    "result_summary": result_summary
                 })
 
                 # 跟踪搜索结果
                 if func_name == "search_files" and tool_result.get("success"):
                     final_result["success"] = True
-                    final_result["results"] = tool_result.get("results", [])
-                    final_result["total"] = tool_result.get("total", 0)
+                    new_results = tool_result.get("results", [])
+                    if new_results:
+                        existing = {r.get("full_path", "") for r in final_result["results"]}
+                        for r in new_results:
+                            if r.get("full_path", "") not in existing:
+                                final_result["results"].append(r)
+                                existing.add(r.get("full_path", ""))
+                        final_result["total"] = len(final_result["results"])
+                    elif not final_result["results"]:
+                        final_result["total"] = 0
                 elif func_name == "search_by_tag" and tool_result.get("success"):
                     final_result["success"] = True
                     final_result["results"] = tool_result.get("results", [])
@@ -399,6 +587,9 @@ class SearchAgent:
                 elif func_name in ("add_tags", "remove_tags"):
                     final_result["success"] = tool_result.get("success", True)
                     final_result["message"] = tool_result.get("message", "")
+                elif func_name == "read_file_contents" and tool_result.get("success"):
+                    # 收集读取到的文件内容，供后续 AI 分析
+                    read_contents.update(tool_result.get("contents", {}))
 
                 # 将工具结果返回给 AI
                 messages.append({
@@ -422,6 +613,12 @@ class SearchAgent:
                 final_result["message"] = "；".join(parts) if parts else "操作完成"
             else:
                 final_result["message"] = "未执行任何操作"
+
+        # 内容搜索第二阶段：如果 Agent 读取了文件内容，调用 AI 做结构化内容分析
+        if read_contents and self.ai_available and self.client:
+            content_results = self.analyze_file_contents(read_contents, user_input)
+            final_result["content_results"] = content_results
+            logger.info(f"内容分析完成: {len(content_results)} 个匹配文件")
 
         return final_result
 
@@ -468,6 +665,20 @@ class SearchAgent:
         elif name == "suggest_tags":
             return {"success": True, "tags": self._suggest_tags_rule(args.get("file_info", {}))}
 
+        elif name == "read_file_contents":
+            file_paths = args.get("file_paths", [])
+            if not file_paths:
+                return {"success": False, "error": "未提供文件路径", "contents": {}}
+            if not self.content_reader or not self.content_reader.enabled:
+                return {"success": False, "error": "内容读取器未启用", "contents": {}}
+            contents = {}
+            for fp in file_paths[:20]:  # 最多20个
+                if fp and os.path.isfile(fp):
+                    text = self.content_reader.read_content(fp, 2000)
+                    contents[fp] = text if text else "(无法提取内容或格式不支持)"
+            return {"success": True, "contents": contents,
+                    "found": len(contents), "requested": len(file_paths[:20])}
+
         return {"success": False, "error": f"未知工具: {name}"}
 
     def _summarize_tool_result(self, func_name: str, result: dict) -> str:
@@ -491,6 +702,9 @@ class SearchAgent:
         elif func_name == "suggest_tags":
             tags = result.get("tags", [])
             return f"推荐标签: {', '.join(tags) if tags else '无'}"
+        elif func_name == "read_file_contents":
+            total = result.get("found", 0)
+            return f"读取了 {total} 个文件的内容"
         return str(result)
 
     # ============ 快速匹配（规则优先路径） ============
@@ -532,6 +746,21 @@ class SearchAgent:
                     return result
 
         return None  # 未匹配，交给 Agent
+
+    def _fast_search(self, user_input: str) -> dict:
+        """快速搜索路径：规则转查询 → 直接搜索，跳过 AI"""
+        query = self._build_everything_query(user_input)
+        logger.info(f"快速搜索: '{user_input}' → '{query}'")
+        if self.search_engine:
+            result = self.search_engine.search(query)
+            result["message"] = f"搜索: {query}"
+            result["actions"] = [{
+                "tool": "search_files",
+                "args": {"query": query},
+                "result_summary": f"搜索到 {result.get('total', 0)} 个文件"
+            }]
+            return result
+        return {"success": False, "results": [], "error": "搜索引擎不可用", "total": 0, "message": ""}
 
     # ============ 规则降级搜索 ============
 
@@ -646,6 +875,81 @@ class SearchAgent:
                 tags.extend(tag_list)
 
         return list(dict.fromkeys(tags))[:5]
+
+    # ============ 内容相关性分析 ============
+
+    def analyze_file_contents(self, file_contents: dict, user_query: str) -> list:
+        """
+        使用 AI 分析文件内容是否匹配用户搜索意图（二次分析）
+        流程：文件名匹配候选文件 → 读取内容 → AI 判断内容是否真正相关
+        :param file_contents: {file_path: text_content}
+        :param user_query: 用户原始查询
+        :return: [{"file_path": str, "file_name": str, "relevance": float,
+                    "reason": str, "snippet": str}, ...]
+        """
+        if not file_contents or not self.ai_available:
+            return []
+
+        # 只保留有内容的文件
+        valid = {fp: txt for fp, txt in file_contents.items() if txt and len(txt) > 20}
+        if not valid:
+            return []
+
+        # 构造分析 prompt
+        files_info = []
+        for fp, txt in valid.items():
+            fname = os.path.basename(fp)
+            snippet = txt[:1000]
+            files_info.append(f"--- {fname} ---\n路径: {fp}\n内容片段: {snippet}\n")
+
+        prompt = f"""用户搜索意图: {user_query}
+
+以下是通过文件名匹配找到的候选文件及其内容片段。请逐个分析：
+1. 这个文件的内容是否真正包含/讨论了用户想找的东西？
+2. 用户是在找"包含XXX内容"的文档，而非仅仅是"文件名叫XXX"的文档
+
+候选文件列表:
+{chr(10).join(files_info)}
+
+请以 JSON 数组格式返回，只返回内容确实相关的文件（相关性 >= 0.3），按相关性从高到低排序:
+[{{"file_path": "完整路径", "file_name": "文件名", "relevance": 0.0~1.0, "reason": "20字以内中文理由", "snippet": "最相关的内容片段(50字内)"}}]
+
+判断标准:
+- 用户想找包含特定内容的文档 → 检查文件内容是否确实包含/讨论该主题
+- 文件名匹配但内容无关 → 不返回
+- 文件名不匹配但内容高度相关 → 高分返回
+- 模糊匹配也值得返回（如用户搜"机器学习"，文档讨论"神经网络"也算相关）
+- 只返回 JSON 数组，不要任何其他文字"""
+
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": "你是文件内容分析专家。只输出JSON数组，不要其他内容。"},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.1,
+                max_tokens=1500,
+            )
+            content = response.choices[0].message.content or "[]"
+            content = content.strip()
+            if content.startswith("```"):
+                lines = content.split("\n")
+                content = "\n".join(lines[1:])
+                if content.endswith("```"):
+                    content = content[:-3]
+                content = content.strip()
+            results = json.loads(content)
+            if isinstance(results, list):
+                return results
+        except Exception as e:
+            logger.error(f"内容分析失败: {e}")
+
+        return []
+
+    def clear_cache(self):
+        """清空 AI 缓存"""
+        self.cache.clear()
 
     # ============ 兼容旧接口 ============
 

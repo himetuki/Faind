@@ -5,12 +5,23 @@ Faind 主入口
 
 import sys
 import os
+import logging
 from pathlib import Path
+
+# 配置日志 — 同时输出到终端和文件
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(name)s] %(levelname)s: %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+    ]
+)
 
 import config
 from ai_parser import SearchAgent
 from everything_search import EverythingSearch
 from tag_manager import TagManager
+from content_reader import ContentReader
 
 
 def ensure_local_files():
@@ -51,7 +62,8 @@ def main():
     print("[Faind] 正在初始化模块...")
     search_engine = EverythingSearch()
     tag_manager = TagManager()
-    agent = SearchAgent(search_engine, tag_manager)
+    content_reader = ContentReader()
+    agent = SearchAgent(search_engine, tag_manager, content_reader)
     print("[Faind] 模块初始化完成")
 
     # 启动 GUI
@@ -62,7 +74,7 @@ def main():
     ctk.set_default_color_theme("blue")
 
     app = FaindApp()
-    app.set_modules(search_engine, agent, tag_manager)
+    app.set_modules(search_engine, agent, tag_manager, content_reader)
     app.check_status()
 
     print("[Faind] 正在启动界面...")

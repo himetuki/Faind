@@ -1,6 +1,6 @@
 {
   "ai": {
-    "provider": "DeepSeek",
+    "provider": "GLM",
     "base_url": "https://api.deepseek.com",
     "api_key": "",
     "model": "deepseek-v4-flash",
@@ -13,13 +13,12 @@
     "use_es_cli": false,
     "es_cli_path": ""
   },
-  "tmsu": {
-    "executable_path": "tmsu.exe",
-    "db_path": ""
-  },
   "ui": {
     "max_results": 100,
     "theme": "Dark"
+  },
+  "search": {
+    "fast_search": true
   },
   "search_filters": {
     "enabled": true,
@@ -42,5 +41,15 @@
     ],
     "exclude_paths": [],
     "folder_sort_order": "first"
+  },
+  "content_reader": {
+    "enabled": false,
+    "max_chars_per_file": 5000,
+    "supported_formats": [
+      ".pdf", ".docx", ".doc", ".xlsx", ".xls",
+      ".pptx", ".ppt", ".txt", ".md", ".rtf",
+      ".epub", ".html", ".htm", ".odt", ".ods", ".odp"
+    ],
+    "ai_summary_enabled": false
   }
 }

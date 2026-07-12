@@ -58,6 +58,8 @@ a = Analysis(
         'anyio',
         'sniffio',
         'annotated_types',
+        # pyxtxt 文档读取（try/except 中动态导入）
+        'pyxtxt',
     ],
     hookspath=[],
     hooksconfig={},

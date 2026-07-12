@@ -46,7 +46,6 @@ json
 {
   "ai": { ... },
   "everything": { ... },
-  "tmsu": { ... },
   "content_reader": {
     "enabled": false,
     "max_chars_per_file": 5000,
