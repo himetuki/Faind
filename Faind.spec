@@ -63,7 +63,11 @@ a = Analysis(
     [str(ROOT / 'main.py')],
     pathex=[str(ROOT)],
     binaries=[],
-    datas=_collect_library_datas() + CERTIFI_DATAS,
+    datas=_collect_library_datas() + CERTIFI_DATAS + [
+        # 许可证文件（随 exe 分发）
+        (str(ROOT / 'LICENSE'), '.'),
+        (str(ROOT / 'NOTICE.txt'), '.'),
+    ],
     hiddenimports=[
         'PySide6',
         'qfluentwidgets',

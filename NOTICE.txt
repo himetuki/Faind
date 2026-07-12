@@ -1,0 +1,68 @@
+Faind - Third-Party Notices
+============================
+
+本项目使用了以下第三方组件，谨此致谢。各组件的许可证文本详见对应目录。
+
+
+Bundled Binaries (library/)
+---------------------------
+
+1. Everything (everything.exe)
+   作者:    David Carpenter
+   许可证:  MIT License
+   来源:    https://www.voidtools.com/
+   路径:    library/Everything/
+
+2. Everything SDK (Everything64.dll)
+   作者:    David Carpenter
+   许可证:  MIT License
+   来源:    https://www.voidtools.com/
+   路径:    library/Everything-SDK/
+
+3. ES CLI (es.exe)
+   作者:    David Carpenter
+   许可证:  MIT License
+   来源:    https://www.voidtools.com/
+   路径:    library/ES-1.1.0.30.x64/
+
+4. fd (fd.exe)
+   作者:    David Peter (sharkdp)
+   许可证:  MIT License / Apache License 2.0 (双许可)
+   来源:    https://github.com/sharkdp/fd
+   路径:    library/fd/
+
+
+Python Runtime Dependencies (via pip)
+--------------------------------------
+
+以下依赖通过 pip 安装并随 PyInstaller 一并打包分发。完整许可证文本参见
+各项目的 PyPI 页面或 GitHub 仓库。
+
+  包名                      许可证
+  ────────────────────────  ───────────────
+  PySide6                   LGPL v3
+  PySide6-Fluent-Widgets    MIT
+  openai                    Apache 2.0
+  requests                  Apache 2.0
+  python-dotenv             BSD-3-Clause
+  pyxtxt                    MIT
+  PyMuPDF                   AGPL v3 / 商业授权
+  certifi                   MPL 2.0
+  httpx                     BSD-3-Clause
+  pydantic                  MIT
+  anyio                     MIT
+  tqdm                      MPL 2.0
+
+  注意: PyMuPDF 以 AGPL v3 发布，Faind 仅用于本地桌面文件读取，
+  不涉及网络服务。如果你需要闭源分发，请考虑 PyMuPDF 的商业授权或
+  使用其他 PDF 读取方案。
+
+
+Compliance Notes
+----------------
+
+- 本项目以 MIT License 发布，详见 LICENSE 文件。
+- 所有内嵌的第三方二进制文件均以 MIT 兼容许可证授权，
+  其原始版权声明和许可证文本随附于 library/ 各子目录中。
+- PyInstaller 单文件打包模式下，LGPL/AGPL 组件的源代码可
+  从本仓库获取，用户可独立替换、重建这些组件。

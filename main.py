@@ -1,6 +1,9 @@
 """
 Faind 主入口
 启动 PySide6 + qfluentwidgets FluentUI 桌面界面
+
+Copyright (c) 2024 Himetuki
+Licensed under the MIT License.
 """
 
 import sys
