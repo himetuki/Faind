@@ -56,33 +56,13 @@ def main():
     # 扫描并创建缺少的本地文件
     ensure_local_files()
 
-    # 初始化模块
-    print("[Faind] 正在初始化模块...")
-    search_engine = EverythingSearch()
-    tag_manager = TagManager()
-    content_reader = ContentReader()
-    agent = SearchAgent(search_engine, tag_manager, content_reader)
+    # 检查首次启动
+    cfg = config.load_config()
+    first_launch = not cfg.get("first_launch_completed", False)
 
-    # 自动确保 Everything 在后台运行（如未运行则启动内嵌便携版）
-    print("[Faind] 检查 Everything 运行状态...")
-    everything_auto_started = search_engine.ensure_everything_running()
-    if everything_auto_started:
-        status = search_engine.get_status_detail()
-        if status.get("started_by_us"):
-            print("[Faind] 使用内嵌 Everything（软件自带）")
-        else:
-            print("[Faind] 使用系统已安装的 Everything")
-    else:
-        print("[Faind] 警告: 无法启动 Everything，搜索功能可能不可用")
-        print("[Faind] 请从 https://www.voidtools.com/ 下载 Everything Portable Zip x64")
-        print("[Faind] 将 Everything64.exe 放入 library/Everything/ 目录")
-
-    print("[Faind] 模块初始化完成")
-
-    # 启动 GUI（PySide6 + qfluentwidgets FluentUI）
-    from PySide6.QtWidgets import QApplication
+    # 提前创建 QApplication（首次启动弹窗需要）
+    from PySide6.QtWidgets import QApplication, QMessageBox
     from PySide6.QtCore import Qt
-    from gui import FaindApp
 
     # 启用高 DPI 缩放
     QApplication.setHighDpiScaleFactorRoundingPolicy(
@@ -90,6 +70,66 @@ def main():
     )
     qt_app = QApplication(sys.argv)
     qt_app.setAttribute(Qt.ApplicationAttribute.AA_DontCreateNativeWidgetSiblings)
+
+    # 首次启动引导弹窗
+    if first_launch:
+        reply = QMessageBox.question(
+            None,
+            "欢迎使用 Faind",
+            "检测到您是首次使用 Faind。\n\n"
+            "是否启用内部 Everything 搜索引擎？\n\n"
+            "✅ 启用后：\n"
+            "  · Everything 将随 Faind 启动并扫描索引\n"
+            "  · 扫描完成前使用 fd 快速搜索\n"
+            "  · 扫描完成后自动切换为 Everything 高速搜索\n\n"
+            "❌ 不启用：\n"
+            "  · 仅使用 fd 进行文件搜索\n"
+            "  · 无需后台服务，启动更快\n\n"
+            "（后续可在「设置」页面随时更改）",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes
+        )
+        enable_everything = (reply == QMessageBox.StandardButton.Yes)
+        cfg["everything_service"]["enabled"] = enable_everything
+        cfg["first_launch_completed"] = True
+        config.save_config(cfg)
+        print(f"[Faind] 首次启动引导完成，Everything 服务: {'启用' if enable_everything else '不启用'}")
+
+    # 初始化模块
+    print("[Faind] 正在初始化模块...")
+    search_engine = EverythingSearch()
+    tag_manager = TagManager()
+    content_reader = ContentReader()
+    agent = SearchAgent(search_engine, tag_manager, content_reader)
+
+    # 自动确保搜索后端就绪
+    print("[Faind] 检查搜索后端状态...")
+    everything_auto_started = search_engine.ensure_everything_running()
+    if everything_auto_started:
+        status = search_engine.get_status_detail()
+        backend = status.get("backend", "unknown")
+        if backend == "fd":
+            if status.get("transitional"):
+                print("[Faind] 过渡模式：当前使用 fd，等待 Everything 索引就绪后自动切换")
+            elif status.get("everything_service_enabled"):
+                print("[Faind] Everything 服务模式，使用 fd 搜索后端")
+            else:
+                print("[Faind] 使用 fd 搜索后端（无需后台服务）")
+        elif status.get("started_by_us"):
+            print("[Faind] 使用内嵌 Everything（软件自带）")
+        else:
+            print("[Faind] 使用系统已安装的 Everything")
+    else:
+        print("[Faind] 警告: 无法启动搜索后端，搜索功能可能不可用")
+        print("[Faind] 请确保至少一种搜索后端可用：")
+        print("[Faind]   - fd.exe 放入 library/fd/ 目录（推荐，无需后台服务）")
+        print("[Faind]   - Everything.exe 或 Everything64.exe 放入 library/Everything/ 目录")
+        print("[Faind]   - 或安装 Everything: https://www.voidtools.com/")
+
+    print("[Faind] 模块初始化完成")
+
+    # 启动 GUI（PySide6 + qfluentwidgets FluentUI）
+    from gui import FaindApp
 
     # FaindWindow 内部会根据配置自动设置 light/dark 主题
     window = FaindApp()

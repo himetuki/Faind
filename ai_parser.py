@@ -764,6 +764,21 @@ class SearchAgent:
 
     # ============ 规则降级搜索 ============
 
+    @staticmethod
+    def _normalize_path_keyword(path_val: str) -> str:
+        """将中文路径描述转换为标准盘符路径
+        例如: "E盘里" → "E:\\", "E盘" → "E:\\", "E:\\dir" 保持不变
+        """
+        import re as _re_path
+        # "X盘里/中/下/内" → "X:\"
+        m = _re_path.match(r'^([A-Za-z])\s*盘(?:里|中|下|内|上)?$', path_val)
+        if m:
+            return f"{m.group(1).upper()}:\\"
+        # 已经是标准路径格式则保持不变
+        if _re_path.match(r'^[A-Za-z]:[\\\\/]', path_val):
+            return path_val
+        return path_val
+
     def _build_everything_query(self, text: str) -> str:
         """将自然语言转为 Everything 搜索语法（规则降级方案）
         
@@ -804,8 +819,18 @@ class SearchAgent:
 
         path_match = re.search(r'(?:在|路径|path:)\s*(\S+)', remaining)
         if path_match:
-            parts.append(f"path:{path_match.group(1)}")
+            path_val = self._normalize_path_keyword(path_match.group(1))
+            parts.append(f"path:{path_val}")
             remaining = remaining.replace(path_match.group(0), "").strip()
+
+        # 兜底：检测裸 X盘 模式（不含"在"前缀的情况，如"E盘里的md文件"）
+        standalone_drive = re.search(r'([A-Za-z])\s*盘', remaining)
+        if standalone_drive:
+            root = f"{standalone_drive.group(1).upper()}:\\"
+            # 避免与上面重复添加
+            if not any(root in p for p in parts):
+                parts.append(f"path:{root}")
+            remaining = remaining.replace(standalone_drive.group(0), "").strip()
 
         # 路径优先策略：剩余关键词默认使用 path: 搜索
         # 这样可以匹配路径/文件夹名中的主题、人名、系列

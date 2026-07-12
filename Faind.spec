@@ -36,6 +36,8 @@ a = Analysis(
     pathex=[str(ROOT)],
     binaries=[],
     datas=[
+        # fd 搜索后端（默认，轻量无依赖）
+        (str(ROOT / 'library' / 'fd'), 'library/fd'),
         # Everything SDK DLL（运行时必需）
         (str(ROOT / 'library' / 'Everything-SDK' / 'dll' / 'Everything64.dll'), 'library/Everything-SDK/dll'),
         # ES CLI（DLL降级备用）

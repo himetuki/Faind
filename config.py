@@ -180,11 +180,19 @@ DEFAULT_CONFIG = {
         "temperature": 0.2,
         "enabled": True
     },
+    "search_engine": "auto",  # "auto" | "fd" | "everything_dll" | "everything_es"
+    "everything_service": {
+        "enabled": False,     # 是否启用内部 Everything（随 Faind 启动并扫描）
+    },
     "everything": {
         "dll_path": "",
         "use_es_cli": False,
         "es_cli_path": ""
     },
+    "fd": {
+        "path": ""
+    },
+    "first_launch_completed": False,  # 首次启动引导是否已完成
     "ui": {
         "max_results": 100,
         "theme": "Dark"
@@ -372,31 +380,37 @@ def get_everything_dir() -> Path:
     return get_exe_dir() / "library" / "Everything"
 
 
+def _find_everything_exe(directory: Path) -> str:
+    """在指定目录下查找 Everything 可执行文件（Everything64.exe 或 Everything.exe）"""
+    for name in ("Everything64.exe", "Everything.exe"):
+        exe = directory / name
+        if exe.is_file():
+            return str(exe)
+    return ""
+
+
 def resolve_everything_exe_path() -> str:
     """
-    解析内嵌的 Everything64.exe 路径
+    解析 Everything 可执行文件路径（Everything64.exe 或 Everything.exe）
     优先持久化位置，其次应用目录（开发模式/MEIPASS）
     """
-    persistent = get_everything_dir() / "Everything64.exe"
-    if persistent.exists():
-        return str(persistent)
+    persistent = _find_everything_exe(get_everything_dir())
+    if persistent:
+        return persistent
 
     app_dir = get_app_dir()
-    candidates = [
-        app_dir / "library" / "Everything" / "Everything64.exe",
-        app_dir / "Everything64.exe",
-    ]
-    for candidate in candidates:
-        if candidate.exists():
-            return str(candidate)
+    found = _find_everything_exe(app_dir / "library" / "Everything")
+    if found:
+        return found
 
     # 常见安装路径（用户可能已安装）
-    for p in [
-        r"C:\Program Files\Everything\Everything64.exe",
-        r"C:\Program Files (x86)\Everything\Everything64.exe",
+    for base in [
+        r"C:\Program Files\Everything",
+        r"C:\Program Files (x86)\Everything",
     ]:
-        if os.path.isfile(p):
-            return p
+        found = _find_everything_exe(Path(base))
+        if found:
+            return found
 
     return ""
 
@@ -408,15 +422,15 @@ def _ensure_everything_extracted() -> Path:
     """
     import shutil
     target_dir = get_everything_dir()
-    target_exe = target_dir / "Everything64.exe"
+    target_found = _find_everything_exe(target_dir)
 
-    if target_exe.exists():
+    if target_found:
         return target_dir
 
     if not getattr(sys, 'frozen', False):
         # 开发模式：直接使用 library/Everything/，无需复制
         source_dir = Path(__file__).parent / "library" / "Everything"
-        if (source_dir / "Everything64.exe").exists():
+        if _find_everything_exe(source_dir):
             print(f"[Config] 开发模式，Everything 位于: {source_dir}")
             return source_dir
         return target_dir
@@ -425,7 +439,7 @@ def _ensure_everything_extracted() -> Path:
     meipass = getattr(sys, '_MEIPASS', None)
     if meipass:
         source_dir = Path(meipass) / "library" / "Everything"
-        if source_dir.exists() and (source_dir / "Everything64.exe").exists():
+        if source_dir.exists() and _find_everything_exe(source_dir):
             target_dir.mkdir(parents=True, exist_ok=True)
             for item in source_dir.iterdir():
                 dst = target_dir / item.name
@@ -441,6 +455,28 @@ def _ensure_everything_extracted() -> Path:
             return target_dir
 
     return target_dir
+
+
+def resolve_fd_path() -> str:
+    """
+    解析 fd.exe 路径
+    优先使用配置路径，否则在 library/fd/ 下查找
+    """
+    cfg = load_config()
+    configured_path = cfg.get("fd", {}).get("path", "")
+    if configured_path and os.path.isfile(configured_path):
+        return configured_path
+
+    app_dir = get_app_dir()
+    candidates = [
+        app_dir / "library" / "fd" / "fd.exe",
+        app_dir / "fd.exe",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+
+    return ""
 
 
 def resolve_es_cli_path() -> str:
