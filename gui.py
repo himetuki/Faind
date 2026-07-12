@@ -1,6 +1,6 @@
 """
-Faind GUI - 基于 customtkinter 的原生桌面界面
-替代 Eel+Chrome 架构，零浏览器依赖，微小占用
+Faind GUI - 基于 PySide6 + qfluentwidgets 的 FluentUI 桌面界面
+替代 customtkinter 架构，使用 Fluent Design 风格
 """
 
 import os
@@ -8,9 +8,46 @@ import sys
 import json
 import threading
 import logging
-import customtkinter as ctk
+import collections
+import datetime
+import time
 from pathlib import Path
-from tkinter import Menu
+
+# ============ PySide6 ============
+from PySide6.QtCore import Qt, Signal, QThread, QTimer, QSize, QPoint, QEvent, QMutex, QMutexLocker
+from PySide6.QtGui import QIcon, QFont, QAction, QColor, QMouseEvent, QKeyEvent
+from PySide6.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QFrame, QLabel,
+    QScrollArea, QSplitter, QMenu, QApplication, QStackedWidget,
+    QFileDialog, QSizePolicy, QSpacerItem, QCheckBox as QCheckBoxNative,
+    QTextEdit, QPushButton, QDialog, QLineEdit, QGridLayout,
+    QGraphicsDropShadowEffect, QListWidget, QListWidgetItem,
+)
+
+# ============ qfluentwidgets ============
+from qfluentwidgets import (
+    FluentWindow, NavigationInterface, NavigationItemPosition,
+    FluentIcon, InfoBar, InfoBarPosition,
+    PrimaryPushButton, TransparentPushButton, HyperlinkButton,
+    SearchLineEdit, LineEdit, TextEdit, PlainTextEdit,
+    CardWidget, ElevatedCardWidget, SimpleCardWidget,
+    TitleLabel, BodyLabel, CaptionLabel, StrongBodyLabel, SubtitleLabel,
+    ComboBox, CheckBox, SwitchButton,
+    ScrollArea, SingleDirectionScrollArea, SmoothScrollArea,
+    Dialog, MessageBox,
+    ProgressBar, IndeterminateProgressBar,
+    ToolTip, ToolTipFilter,
+    FlowLayout,
+    qconfig, Theme, setTheme, setThemeColor,
+    isDarkTheme, FluentStyleSheet,
+    StateToolTip, TeachingTip, TeachingTipTailPosition,
+    Flyout, FlyoutAnimationType, FlyoutView,
+    TabBar, TabCloseButtonDisplayMode,
+    SpinBox, Slider,
+    InfoBarIcon,
+    PixmapLabel,
+    HorizontalSeparator, VerticalSeparator,
+)
 
 import config
 from content_reader import ContentReader
@@ -18,21 +55,73 @@ from ai_cache import NotRelevantCache
 
 logger = logging.getLogger(__name__)
 
-# ============ 主题感知颜色 ============
-def _tc():
-    """返回当前主题适配的颜色字典"""
-    dark = ctk.get_appearance_mode() == "Dark"
-    return {
-        'bg':          '#2b2b2b' if dark else '#ffffff',
-        'bg_hover':    '#3a3a3a' if dark else '#f0f2f5',
-        'border':      '#505050' if dark else '#e0e4e8',
-        'border_light':'#404040' if dark else '#f0f2f5',
-        'text_sec':    '#a0a0a0' if dark else '#7f8c8d',
-        'text_dim':    '#707070' if dark else '#bdc3c7',
-        'text_dark':   '#e0e0e0' if dark else '#2c3e50',
-        'accent_bg':   '#1e3a5f' if dark else '#e8f0fe',
-        'accent_hover':'#2a4a70' if dark else '#d0e4f7',
-    }
+
+# ============ 全局日志捕获 ============
+class LogCapture(logging.Handler):
+    """
+    单例：捕获所有 print() 输出和 logging 日志到环形缓冲区。
+    供设置界面的日志窗口读取展示。
+    """
+    _instance = None
+
+    def __new__(cls, *args, **kwargs):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __init__(self, max_lines: int = 1000):
+        if hasattr(self, '_buffer'):
+            return
+        super().__init__()
+        self._lock = threading.Lock()
+        self._buffer = collections.deque(maxlen=max_lines)
+        self._original_stdout = sys.stdout
+        self._hooked = False
+
+    def hook(self):
+        if self._hooked:
+            return
+        self.setLevel(logging.DEBUG)
+        self.setFormatter(logging.Formatter('[%(name)s] %(levelname)s: %(message)s'))
+        logging.root.addHandler(self)
+        sys.stdout = self
+        self._hooked = True
+
+    def unhook(self):
+        if not self._hooked:
+            return
+        sys.stdout = self._original_stdout
+        logging.root.removeHandler(self)
+        self._hooked = False
+
+    def write(self, message: str):
+        if message and message.rstrip():
+            ts = datetime.datetime.now().strftime('%H:%M:%S')
+            with self._lock:
+                for line in message.rstrip('\n').split('\n'):
+                    if line.strip():
+                        self._buffer.append(f"[{ts}] {line}")
+        self._original_stdout.write(message)
+
+    def flush(self):
+        self._original_stdout.flush()
+
+    def emit(self, record: logging.LogRecord):
+        try:
+            msg = self.format(record)
+            with self._lock:
+                self._buffer.append(msg)
+        except Exception:
+            self.handleError(record)
+
+    def get_messages(self) -> list:
+        with self._lock:
+            return list(self._buffer)
+
+    def get_text(self, tail: int = 500) -> str:
+        with self._lock:
+            msgs = list(self._buffer)[-tail:]
+        return '\n'.join(msgs)
 
 
 # ============ 文件类型图标映射 ============
@@ -42,6 +131,7 @@ FILE_ICON_MAP = {
     'ppt': ('📑', '#e8f5e9'), 'pptx': ('📑', '#e8f5e9'),
     'jpg': ('🖼', '#fce4ec'), 'jpeg': ('🖼', '#fce4ec'), 'png': ('🖼', '#fce4ec'),
     'gif': ('🖼', '#fce4ec'), 'bmp': ('🖼', '#fce4ec'), 'svg': ('🖼', '#fce4ec'),
+    'webp': ('🖼', '#fce4ec'),
     'mp4': ('🎬', '#f3e5f5'), 'avi': ('🎬', '#f3e5f5'), 'mkv': ('🎬', '#f3e5f5'),
     'mp3': ('🎵', '#f3e5f5'), 'wav': ('🎵', '#f3e5f5'), 'flac': ('🎵', '#f3e5f5'),
     'zip': ('📦', '#fff8e1'), 'rar': ('📦', '#fff8e1'), '7z': ('📦', '#fff8e1'),
@@ -72,1157 +162,1100 @@ def get_file_color(ext, is_folder=False):
     return FILE_ICON_MAP.get((ext or '').lower(), ('📄', '#f5f5f5'))[1]
 
 
-# ============ Toast 通知 ============
-class ToastManager:
-    """轻量 Toast 通知"""
-    def __init__(self, root):
-        self.root = root
-        self._after_id = None
+# ============ 后台工作线程 ============
+class SearchWorker(QThread):
+    """后台搜索工作线程"""
+    finished = Signal(dict)       # 完整搜索结果
+    content_ready = Signal(list)   # 内容搜索结果
+    index_progress = Signal(float, int)  # 索引进度
 
-    def show(self, message, level='info', duration=2500):
-        if self._after_id:
-            self.root.after_cancel(self._after_id)
-
-        colors = {'info': '#4a90d9', 'success': '#27ae60', 'warning': '#f39c12', 'error': '#e74c3c'}
-        color = colors.get(level, colors['info'])
-
-        toast = ctk.CTkFrame(self.root, fg_color=color, corner_radius=8, height=36)
-        toast.place(relx=0.5, rely=0.95, anchor='center')
-
-        label = ctk.CTkLabel(toast, text=message, text_color='white', font=ctk.CTkFont(size=13))
-        label.pack(padx=16, pady=6)
-
-        def _remove():
-            try:
-                toast.place_forget()
-                toast.destroy()
-            except Exception:
-                pass
-
-        self._after_id = self.root.after(duration, _remove)
-
-
-# ============ 主应用窗口 ============
-class FaindApp(ctk.CTk):
-    """Faind 主窗口"""
-
-    def __init__(self):
-        super().__init__()
-        self.title("Faind - 智能文件定位与标签系统")
-        self.geometry("1200x800")
-        self.minsize(900, 600)
-
-        # 设置主题（从配置加载）
-        _cfg = config.load_config()
-        _theme = _cfg.get('ui', {}).get('theme', 'Dark')
-        ctk.set_appearance_mode(_theme)
-        ctk.set_default_color_theme("blue")
-
-        # 全局引用（由 main.py 注入）
-        self.search_engine = None
-        self.agent = None
-        self.tag_manager = None
-        self.content_reader = None
-
-        # 状态
-        self._search_history = []
-        self._selected_files = set()
-        # 从配置加载搜索过滤器（含默认排除文件夹）
-        _cfg = config.load_config()
-        _sf = _cfg.get('search_filters', {})
-        # 如果用户配置中 exclude_folders 为空，使用默认值
-        _default_sf = config.DEFAULT_CONFIG.get('search_filters', {})
-        if not _sf.get('exclude_folders'):
-            _sf['exclude_folders'] = _default_sf.get('exclude_folders', [])
-        self._search_filters = _sf
-        self._active_filter = None
-        self._search_results = []
-        self._is_searching = False
-        self._search_timer = None
-        self._last_search_result = {}  # 最近一次搜索的完整结果（用于AI详情弹窗）
-        self._search_timeout = 60  # 搜索超时秒数
-        self._last_query = ""  # 最近一次搜索词
-        self._not_relevant_cache = None  # 非本项缓存（set_modules 中初始化）
-
-        # Toast
-        self.toast = ToastManager(self)
-
-        # 构建 UI
-        self._build_ui()
-
-    def set_modules(self, search_engine, agent, tag_manager, content_reader=None):
-        """注入模块实例"""
-        self.search_engine = search_engine
+    def __init__(self, agent, query, fast_mode=True, parent=None):
+        super().__init__(parent)
         self.agent = agent
-        self.tag_manager = tag_manager
+        self.query = query
+        self.fast_mode = fast_mode
+
+    def run(self):
+        try:
+            result = self.agent.process(self.query, fast_mode=self.fast_mode)
+            self.finished.emit(result)
+        except Exception as e:
+            self.finished.emit({
+                "success": False, "results": [], "error": str(e),
+                "total": 0, "message": f"搜索异常: {e}"
+            })
+
+
+class ContentSearchWorker(QThread):
+    """后台内容搜索工作线程"""
+    content_ready = Signal(list)
+    error = Signal(str)
+
+    def __init__(self, agent, content_reader, search_results, query,
+                 content_reader_enabled, ai_summary_enabled,
+                 not_relevant_cache, last_query, parent=None):
+        super().__init__(parent)
+        self.agent = agent
         self.content_reader = content_reader
-        self._not_relevant_cache = NotRelevantCache()
-
-    def _build_ui(self):
-        # 顶部栏
-        header = ctk.CTkFrame(self, height=48, corner_radius=0)
-        header.pack(fill='x', side='top')
-        header.pack_propagate(False)
-
-        header_left = ctk.CTkFrame(header, fg_color='transparent')
-        header_left.pack(side='left', padx=12)
-
-        ctk.CTkLabel(header_left, text="🔍 Faind", font=ctk.CTkFont(size=20, weight='bold'),
-                      text_color='#4a90d9').pack(side='left', pady=10)
-
-        self._status_label = ctk.CTkLabel(header_left, text="●", font=ctk.CTkFont(size=10),
-                                           text_color=_tc()['text_dim'])
-        self._status_label.pack(side='left', padx=8)
-
-        # 视图切换标签
-        header_center = ctk.CTkFrame(header, fg_color='transparent')
-        header_center.pack(side='left', expand=True)
-
-        self._tab_search = ctk.CTkButton(header_center, text="🔍 搜索", width=100, height=32,
-                                          fg_color='#4a90d9', hover_color='#357abd',
-                                          font=ctk.CTkFont(size=13), command=lambda: self._switch_view('search'))
-        self._tab_search.pack(side='left', padx=4, pady=8)
-
-        self._tab_tags = ctk.CTkButton(header_center, text="🏷 标签管理", width=100, height=32,
-                                        fg_color='transparent', hover_color=_tc()['bg_hover'],
-                                        text_color=_tc()['text_sec'], border_width=1, border_color=_tc()['border'],
-                                        font=ctk.CTkFont(size=13), command=lambda: self._switch_view('tags'))
-        self._tab_tags.pack(side='left', padx=4, pady=8)
-
-        # 右侧按钮
-        header_right = ctk.CTkFrame(header, fg_color='transparent')
-        header_right.pack(side='right', padx=12)
-
-        ctk.CTkButton(header_right, text="🌙", width=36, height=32,
-                       fg_color='transparent', hover_color=_tc()['bg_hover'],
-                       font=ctk.CTkFont(size=14), command=self._toggle_theme).pack(side='left', padx=2)
-
-        ctk.CTkButton(header_right, text="📋", width=36, height=32,
-                       fg_color='transparent', hover_color=_tc()['bg_hover'],
-                       font=ctk.CTkFont(size=14), command=self._show_history).pack(side='left', padx=2)
-
-        ctk.CTkButton(header_right, text="⚙", width=36, height=32,
-                       fg_color='transparent', hover_color=_tc()['bg_hover'],
-                       font=ctk.CTkFont(size=14), command=self._show_settings).pack(side='left', padx=2)
-
-        # 内容区域
-        self._content = ctk.CTkFrame(self, fg_color='transparent')
-        self._content.pack(fill='both', expand=True)
-
-        # 搜索视图
-        self._search_view = self._build_search_view()
-        self._search_view.pack(fill='both', expand=True, in_=self._content)
-
-        # 标签视图
-        self._tags_view = self._build_tags_view()
-        # 不 pack，默认隐藏
-
-        self._current_view = 'search'
-
-    def _toggle_theme(self):
-        """切换深色/浅色主题"""
-        current = ctk.get_appearance_mode()  # 返回 "Dark" 或 "Light"
-        new_mode = "Light" if current == "Dark" else "Dark"
-        ctk.set_appearance_mode(new_mode)
-        # 持久化到配置
-        _cfg = config.load_config()
-        _cfg.setdefault('ui', {})['theme'] = new_mode
-        config.save_config(_cfg)
-        self.toast.show(f"已切换为{'深色' if new_mode == 'Dark' else '浅色'}主题", 'info')
-
-    def _switch_view(self, view):
-        if view == self._current_view:
-            return
-        self._current_view = view
-
-        if view == 'search':
-            self._search_view.pack(fill='both', expand=True, in_=self._content)
-            self._tags_view.pack_forget()
-            self._tab_search.configure(fg_color='#4a90d9', text_color='white', border_width=0)
-            self._tab_tags.configure(fg_color='transparent', text_color=_tc()['text_sec'], border_width=1)
-        else:
-            self._tags_view.pack(fill='both', expand=True, in_=self._content)
-            self._search_view.pack_forget()
-            self._tab_tags.configure(fg_color='#4a90d9', text_color='white', border_width=0)
-            self._tab_search.configure(fg_color='transparent', text_color=_tc()['text_sec'], border_width=1)
-            self._refresh_tags_sidebar()
-
-    # ============ 搜索视图构建 ============
-    def _build_search_view(self):
-        frame = ctk.CTkFrame(self._content, fg_color='transparent')
-
-        # 搜索区域
-        search_section = ctk.CTkFrame(frame, corner_radius=0)
-        search_section.pack(fill='x', padx=0, pady=0)
-
-        # 搜索框
-        search_box = ctk.CTkFrame(search_section, fg_color='transparent')
-        search_box.pack(fill='x', padx=16, pady=(12, 4))
-
-        self._search_var = ctk.StringVar()
-        self._search_entry = ctk.CTkEntry(search_box, textvariable=self._search_var,
-                                           placeholder_text="输入自然语言搜索，如：上周修改的PDF合同",
-                                           font=ctk.CTkFont(size=15), height=40, corner_radius=8,
-                                           border_color=_tc()['border'])
-        self._search_entry.pack(side='left', fill='x', expand=True, padx=(0, 8))
-        self._search_entry.bind('<Return>', lambda e: self._perform_search())
-
-        ctk.CTkButton(search_box, text="搜索", width=80, height=40,
-                       font=ctk.CTkFont(size=14), command=self._perform_search).pack(side='right')
-
-        # 筛选条
-        filter_bar = ctk.CTkFrame(search_section, fg_color='transparent')
-        filter_bar.pack(fill='x', padx=16, pady=(0, 8))
-
-        self._filter_buttons = []
-        for name, query in FORMAT_FILTERS:
-            btn = ctk.CTkButton(filter_bar, text=name, width=60, height=28,
-                                 fg_color='transparent', hover_color=_tc()['accent_hover'],
-                                 text_color=_tc()['text_sec'], border_width=1, border_color=_tc()['border'],
-                                 font=ctk.CTkFont(size=12), corner_radius=14,
-                                 command=lambda q=query, b=None: self._toggle_filter(q))
-            btn.pack(side='left', padx=3)
-            self._filter_buttons.append((btn, query))
-
-        # 功能开关（简单搜索 + 内容搜索 + AI总结）
-        switch_frame = ctk.CTkFrame(filter_bar, fg_color='transparent')
-        switch_frame.pack(side='right', padx=4)
-
-        # 简单搜索开关（默认开启，跳过 AI 用规则直接搜文件名）
-        # 加载 fast_search 配置
-        _fs_cfg = config.load_config().get('search', config.DEFAULT_CONFIG.get('search', {}))
-        self._fast_search_enabled = ctk.BooleanVar(value=_fs_cfg.get('fast_search', True))
-        self._fast_search_btn = ctk.CTkButton(switch_frame, text="⚡ 简单搜索", width=90, height=28,
-                                               fg_color=_tc()['accent_bg'] if self._fast_search_enabled.get() else 'transparent',
-                                               hover_color=_tc()['accent_hover'],
-                                               text_color='#4a90d9' if self._fast_search_enabled.get() else _tc()['text_sec'],
-                                               border_width=1, border_color=_tc()['border'],
-                                               font=ctk.CTkFont(size=12), corner_radius=14,
-                                               command=self._toggle_fast_search)
-        self._fast_search_btn.pack(side='left', padx=3)
-
-        # 加载 content_reader 配置
-        _cr_cfg = config.load_config().get('content_reader', config.DEFAULT_CONFIG.get('content_reader', {}))
-        self._content_reader_enabled = ctk.BooleanVar(value=_cr_cfg.get('enabled', False))
-        self._content_reader_btn = ctk.CTkButton(switch_frame, text="📄 内容搜索", width=90, height=28,
-                                                  fg_color='transparent' if not self._content_reader_enabled.get() else _tc()['accent_bg'],
-                                                  hover_color=_tc()['accent_hover'],
-                                                  text_color=_tc()['text_sec'] if not self._content_reader_enabled.get() else '#4a90d9',
-                                                  border_width=1, border_color=_tc()['border'],
-                                                  font=ctk.CTkFont(size=12), corner_radius=14,
-                                                  command=self._toggle_content_reader)
-        self._content_reader_btn.pack(side='left', padx=3)
-
-        self._ai_summary_enabled = ctk.BooleanVar(value=_cr_cfg.get('ai_summary_enabled', False))
-        self._ai_summary_btn = ctk.CTkButton(switch_frame, text="🤖 AI总结", width=85, height=28,
-                                              fg_color='transparent' if not self._ai_summary_enabled.get() else _tc()['accent_bg'],
-                                              hover_color=_tc()['accent_hover'],
-                                              text_color=_tc()['text_sec'] if not self._ai_summary_enabled.get() else '#4a90d9',
-                                              border_width=1, border_color=_tc()['border'],
-                                              font=ctk.CTkFont(size=12), corner_radius=14,
-                                              command=self._toggle_ai_summary)
-        self._ai_summary_btn.pack(side='left', padx=3)
-
-        # 标签操作栏（选中文件时显示）
-        self._tag_action_bar = ctk.CTkFrame(frame, fg_color=_tc()['accent_bg'], height=40, corner_radius=0)
-        self._tag_action_bar.pack_forget()  # 默认隐藏
-
-        self._selected_count_label = ctk.CTkLabel(self._tag_action_bar, text="0 个文件已选中",
-                                                    font=ctk.CTkFont(size=13), text_color='#4a90d9')
-        self._selected_count_label.pack(side='left', padx=12)
-
-        self._tag_input_var = ctk.StringVar()
-        tag_input = ctk.CTkEntry(self._tag_action_bar, textvariable=self._tag_input_var,
-                                  placeholder_text="输入标签指令，如：标记为 高数资料",
-                                  font=ctk.CTkFont(size=13), height=32, width=300)
-        tag_input.pack(side='left', padx=8, fill='x', expand=True)
-        tag_input.bind('<Return>', lambda e: self._apply_tags())
-
-        ctk.CTkButton(self._tag_action_bar, text="🏷 添加标签", width=90, height=32,
-                       font=ctk.CTkFont(size=13), command=self._apply_tags).pack(side='right', padx=12)
-
-        # AI 回复区（默认隐藏）
-        self._ai_response_frame = ctk.CTkFrame(frame, fg_color=_tc()['accent_bg'], corner_radius=0)
-        self._ai_response_frame.pack_forget()
-
-        ai_header = ctk.CTkFrame(self._ai_response_frame, fg_color='transparent')
-        ai_header.pack(fill='x', padx=12, pady=(8, 0))
-        ctk.CTkLabel(ai_header, text="🤖 AI 助手", font=ctk.CTkFont(size=13, weight='bold'),
-                      text_color='#4a90d9').pack(side='left')
-        ctk.CTkButton(ai_header, text="📋 查看详情", width=85, height=24,
-                       fg_color='transparent', hover_color=_tc()['accent_hover'],
-                       text_color='#4a90d9', font=ctk.CTkFont(size=11),
-                       border_width=1, border_color=_tc()['border'],
-                       corner_radius=12,
-                       command=self._show_ai_detail).pack(side='left', padx=(8, 0))
-        ctk.CTkButton(ai_header, text="✕", width=24, height=24,
-                       fg_color='transparent', hover_color=_tc()['accent_hover'],
-                       font=ctk.CTkFont(size=12), command=self._hide_ai_response).pack(side='right')
-
-        self._ai_response_text = ctk.CTkTextbox(self._ai_response_frame,
-                                                  font=ctk.CTkFont(size=13),
-                                                  text_color=_tc()['text_dark'],
-                                                  fg_color=_tc()['accent_bg'],
-                                                  wrap='word', activate_scrollbars=True,
-                                                  border_width=0)
-        self._ai_response_text.pack(fill='both', expand=True, padx=12, pady=(0, 8))
-        self._ai_response_text.configure(state='disabled')
-
-        # 拖拽分隔条（AI 回复区 ↔ 结果区域之间）
-        self._splitter_handle = ctk.CTkFrame(frame, height=6, fg_color=_tc()['border'], corner_radius=0)
-        self._splitter_handle.pack_forget()
-        self._splitter_handle.configure(cursor='sb_v_double_arrow')
-        self._splitter_handle.bind('<ButtonPress-1>', self._on_splitter_press)
-        self._splitter_handle.bind('<B1-Motion>', self._on_splitter_drag)
-        self._splitter_handle.bind('<ButtonRelease-1>', self._on_splitter_release)
-        self._ai_response_height = 140  # AI 回复区默认高度
-        self._splitter_dragging = False
-        self._splitter_start_y = 0
-        self._splitter_start_height = 0
-
-        # 结果区域
-        self._results_section = ctk.CTkFrame(frame, fg_color='transparent')
-        self._results_section.pack(fill='both', expand=True, padx=16, pady=8)
-
-        # 结果头部
-        results_header = ctk.CTkFrame(self._results_section, fg_color='transparent')
-        results_header.pack(fill='x', pady=(0, 4))
-
-        self._results_count_label = ctk.CTkLabel(results_header, text="0 个结果",
-                                                   font=ctk.CTkFont(size=13), text_color=_tc()['text_sec'])
-        self._results_count_label.pack(side='left')
-
-        self._query_label = ctk.CTkLabel(results_header, text="",
-                                          font=ctk.CTkFont(family='Courier', size=12), text_color=_tc()['text_sec'])
-        self._query_label.pack(side='left', padx=12)
-
-        # 排序按钮
-        sort_frame = ctk.CTkFrame(results_header, fg_color='transparent')
-        sort_frame.pack(side='right')
-
-        self._sort_first_btn = ctk.CTkButton(sort_frame, text="📁↑", width=36, height=28,
-                                               fg_color=_tc()['accent_bg'], hover_color=_tc()['accent_hover'],
-                                               font=ctk.CTkFont(size=11),
-                                               command=lambda: self._change_sort('first'))
-        self._sort_first_btn.pack(side='left', padx=2)
-
-        self._sort_last_btn = ctk.CTkButton(sort_frame, text="📁↓", width=36, height=28,
-                                              fg_color='transparent', hover_color=_tc()['bg_hover'],
-                                              text_color=_tc()['text_sec'], font=ctk.CTkFont(size=11),
-                                              command=lambda: self._change_sort('last'))
-        self._sort_last_btn.pack(side='left', padx=2)
-
-        self._sort_none_btn = ctk.CTkButton(sort_frame, text="🚫", width=36, height=28,
-                                              fg_color='transparent', hover_color=_tc()['bg_hover'],
-                                              text_color=_tc()['text_sec'], font=ctk.CTkFont(size=11),
-                                              command=lambda: self._change_sort('none'))
-        self._sort_none_btn.pack(side='left', padx=2)
-
-        # 过滤器开关
-        self._filter_toggle_btn = ctk.CTkButton(sort_frame, text="🔽", width=36, height=28,
-                                                   fg_color=_tc()['accent_bg'], hover_color=_tc()['accent_hover'],
-                                                   font=ctk.CTkFont(size=11),
-                                                   command=self._toggle_search_filter)
-        self._filter_toggle_btn.pack(side='left', padx=(8, 2))
-
-        # 结果列表（可滚动）
-        self._results_frame = ctk.CTkScrollableFrame(self._results_section, fg_color='transparent')
-        self._results_frame.pack(fill='both', expand=True)
-
-        # 空状态
-        self._empty_label = ctk.CTkLabel(self._results_frame, text="🔍\n输入关键词开始搜索",
-                                          font=ctk.CTkFont(size=16), text_color=_tc()['text_dim'],
-                                          justify='center')
-        self._empty_label.pack(pady=80)
-
-        return frame
-
-    # ============ 标签管理视图构建 ============
-    def _build_tags_view(self):
-        frame = ctk.CTkFrame(self._content, fg_color='transparent')
-
-        # 左侧标签栏
-        sidebar = ctk.CTkFrame(frame, width=240, corner_radius=0)
-        sidebar.pack(side='left', fill='y', padx=(0, 1))
-        sidebar.pack_propagate(False)
-
-        # 标签搜索
-        search_frame = ctk.CTkFrame(sidebar, fg_color='transparent')
-        search_frame.pack(fill='x', padx=8, pady=8)
-
-        self._tag_search_var = ctk.StringVar()
-        self._tag_search_var.trace_add('write', lambda *_: self._filter_tags_sidebar())
-        ctk.CTkEntry(search_frame, textvariable=self._tag_search_var,
-                      placeholder_text="搜索标签...", font=ctk.CTkFont(size=13),
-                      height=32, corner_radius=6).pack(fill='x')
-
-        # 自定义标签列表
-        ctk.CTkLabel(sidebar, text="🏷 自定义标签", font=ctk.CTkFont(size=13, weight='bold'),
-                      text_color=_tc()['text_sec']).pack(anchor='w', padx=12, pady=(8, 4))
-
-        self._custom_tags_frame = ctk.CTkScrollableFrame(sidebar, fg_color='transparent', height=300)
-        self._custom_tags_frame.pack(fill='x', padx=8)
-
-        # 格式标签
-        ctk.CTkLabel(sidebar, text="📄 格式标签", font=ctk.CTkFont(size=13, weight='bold'),
-                      text_color=_tc()['text_sec']).pack(anchor='w', padx=12, pady=(12, 4))
-
-        fmt_frame = ctk.CTkScrollableFrame(sidebar, fg_color='transparent', height=150)
-        fmt_frame.pack(fill='x', padx=8)
-
-        for name, query in FORMAT_FILTERS:
-            btn = ctk.CTkButton(fmt_frame, text=name, width=200, height=28,
-                                 fg_color='transparent', hover_color=_tc()['bg_hover'],
-                                 text_color=_tc()['text_sec'], anchor='w',
-                                 font=ctk.CTkFont(size=12),
-                                 command=lambda q=query, n=name: self._select_format_tag(q, n))
-            btn.pack(fill='x', pady=1)
-
-        # 新建标签按钮
-        ctk.CTkButton(sidebar, text="＋ 新建标签", height=32,
-                       font=ctk.CTkFont(size=13), command=self._show_create_tag).pack(fill='x', padx=8, pady=12)
-
-        # 右侧内容区
-        content = ctk.CTkFrame(frame, corner_radius=0)
-        content.pack(side='left', fill='both', expand=True)
-
-        content_header = ctk.CTkFrame(content, fg_color='transparent')
-        content_header.pack(fill='x', padx=16, pady=12)
-
-        self._tag_content_title = ctk.CTkLabel(content_header, text="选择一个标签查看文件",
-                                                 font=ctk.CTkFont(size=16, weight='bold'))
-        self._tag_content_title.pack(side='left')
-
-        self._tag_file_count = ctk.CTkLabel(content_header, text="",
-                                              font=ctk.CTkFont(size=13), text_color=_tc()['text_sec'])
-        self._tag_file_count.pack(side='left', padx=12)
-
-        # 标签AI操作栏
-        ai_bar = ctk.CTkFrame(content, fg_color='transparent')
-        ai_bar.pack(fill='x', padx=16, pady=(0, 8))
-
-        self._tag_ai_var = ctk.StringVar()
-        ai_entry = ctk.CTkEntry(ai_bar, textvariable=self._tag_ai_var,
-                                 placeholder_text="AI标签指令：如 '给所有PDF添加文档标签'",
-                                 font=ctk.CTkFont(size=13), height=32)
-        ai_entry.pack(side='left', fill='x', expand=True, padx=(0, 8))
-        ai_entry.bind('<Return>', lambda e: self._execute_tag_ai())
-
-        ctk.CTkButton(ai_bar, text="🤖 执行", width=70, height=32,
-                       font=ctk.CTkFont(size=13), command=self._execute_tag_ai).pack(side='right')
-
-        # 标签文件列表
-        self._tag_file_frame = ctk.CTkScrollableFrame(content, fg_color='transparent')
-        self._tag_file_frame.pack(fill='both', expand=True, padx=16, pady=(0, 12))
-
-        self._tag_empty_label = ctk.CTkLabel(self._tag_file_frame, text="🏷\n从左侧选择标签查看关联文件",
-                                               font=ctk.CTkFont(size=16), text_color=_tc()['text_dim'],
-                                               justify='center')
-        self._tag_empty_label.pack(pady=80)
-
-        return frame
-
-    # ============ 搜索功能 ============
-    def _perform_search(self):
-        query = self._search_var.get().strip()
-        if not query:
-            self.toast.show("请输入搜索内容", "warning")
-            return
-        if self._is_searching:
-            return
-        self._is_searching = True
-
-        full_query = query
-        if self._active_filter:
-            full_query = query + ' ' + self._active_filter
-
-        self._results_count_label.configure(text="搜索中...")
-        self._hide_ai_response()
-
-        # 清空结果
-        for w in self._results_frame.winfo_children():
-            w.destroy()
-
-        ctk.CTkLabel(self._results_frame, text="⏳ 搜索中...",
-                      font=ctk.CTkFont(size=14), text_color=_tc()['text_sec']).pack(pady=40)
-
-        def _do_search():
-            try:
-                fast_mode = self._fast_search_enabled.get()
-                result = self.agent.process(full_query, fast_mode=fast_mode)
-                # 批量查询标签（一次SQL替代N次查询）
-                if result.get('success') and result.get('results'):
-                    fps = [item.get('full_path', '') for item in result['results']
-                           if item.get('full_path') and 'tags' not in item]
-                    if fps:
-                        tag_map = self.tag_manager.get_tags_batch(fps)
-                        for item in result['results']:
-                            fp = item.get('full_path', '')
-                            if fp in tag_map:
-                                item['tags'] = tag_map[fp]
-
-                # 先流式展示搜索结果（不等内容分析）
-                self.after(0, lambda r=result, q=full_query: self._on_search_done(r, q))
-
-                # 后台进行内容搜索（不阻塞主结果显示）
-                # 如果 Agent 已经在循环中完成了内容搜索，则跳过
-                content_results = None
-                if 'content_results' in result:
-                    content_results = result['content_results']
-                    if content_results:
-                        logger.info(f"Agent 已完成内容搜索: {len(content_results)} 个匹配文件")
-                elif (self._content_reader_enabled.get() and self.content_reader
-                        and result.get('success') and result.get('results')):
-                    try:
-                        logger.info("内容搜索已启用，开始提取文件内容...")
-                        search_results = result['results']
-                        cr_cfg = config.load_config().get('content_reader', {})
-                        max_chars = cr_cfg.get('max_chars_per_file', 5000)
-                        top_n = min(len(search_results), 30)
-
-                        # 并行读取文件内容（ThreadPoolExecutor 加速）
-                        file_paths = [item.get('full_path', '') for item in search_results[:top_n]
-                                      if item.get('full_path', '')]
-                        file_contents = self._read_files_parallel(file_paths, max_chars)
-
-                        if file_contents and self._ai_summary_enabled.get():
-                            logger.info(f"AI 内容分析: {len(file_contents)} 个文件")
-                            content_results = self.agent.analyze_file_contents(
-                                file_contents, full_query)
-                        elif file_contents:
-                            content_results = []
-                            for fp, txt in file_contents.items():
-                                name = os.path.basename(fp)
-                                snippet = txt[:200].replace('\n', ' ')
-                                content_results.append({
-                                    'file_path': fp,
-                                    'file_name': name,
-                                    'relevance': 0.5,
-                                    'reason': '内容匹配',
-                                    'snippet': snippet if len(snippet) >= 50 else txt[:200]
-                                })
-                    except Exception as e:
-                        logger.error(f"内容搜索失败: {e}")
-                elif (result.get('success') and result.get('results')
-                      and not self._content_reader_enabled.get()):
-                    logger.info("内容搜索未启用（按 📄内容搜索 按钮开启）")
-
-                # 内容结果就绪后追加到已有结果下方
-                if content_results:
-                    self.after(0, lambda cr=content_results: self._append_content_results(cr))
-
-            except Exception as e:
-                self.after(0, lambda: self._on_search_error(str(e)))
-            finally:
-                self._is_searching = False
-                if self._search_timer:
-                    self._search_timer.cancel()
-                    self._search_timer = None
-
-        def _on_timeout():
-            """搜索超时处理"""
-            if self._is_searching:
-                self._is_searching = False
-                self.after(0, lambda: self._on_search_error("搜索超时，请检查网络连接或简化搜索条件后重试"))
-                self.toast.show("搜索超时，请重试", "warning")
-
-        # 设置超时计时器
-        self._search_timer = threading.Timer(self._search_timeout, _on_timeout)
-        self._search_timer.daemon = True
-        self._search_timer.start()
-
-        threading.Thread(target=_do_search, daemon=True).start()
-
-    def _on_search_done(self, result, query):
-        self._last_search_result = result  # 保存完整结果供 AI 详情弹窗查看
-        self._last_query = query  # 记录搜索词用于非本项匹配
-        for w in self._results_frame.winfo_children():
-            w.destroy()
-
-        if result.get('success'):
-            raw_results = result.get('results', [])
-            # 过滤非本项
-            if self._not_relevant_cache and query:
-                blocked = self._not_relevant_cache.get_blocked_paths(query)
-                self._search_results = [r for r in raw_results
-                                        if r.get('full_path', '').replace('\\', '/') not in blocked]
-            else:
-                self._search_results = raw_results
-            total = len(self._search_results)
-            self._results_count_label.configure(text=f"{total} 个结果")
-            self._query_label.configure(text=query)
-            # 传递 agent 返回的 content_results 给渲染器
-            agent_content = result.get('content_results', [])
-            self._render_results(self._search_results, content_results=agent_content if agent_content else None)
-            if result.get('message'):
-                self._show_ai_response(result['message'])
-        else:
-            self._results_count_label.configure(text="搜索失败")
-            ctk.CTkLabel(self._results_frame, text=f"❌ {result.get('error', '搜索失败')}",
-                          font=ctk.CTkFont(size=14), text_color='#e74c3c').pack(pady=40)
-
-    def _on_search_error(self, error):
-        for w in self._results_frame.winfo_children():
-            w.destroy()
-        self._results_count_label.configure(text="搜索出错")
-        ctk.CTkLabel(self._results_frame, text=f"❌ {error}",
-                      font=ctk.CTkFont(size=14), text_color='#e74c3c').pack(pady=40)
+        self.search_results = search_results
+        self.query = query
+        self.content_reader_enabled = content_reader_enabled
+        self.ai_summary_enabled = ai_summary_enabled
+        self.not_relevant_cache = not_relevant_cache
+        self.last_query = last_query
+
+    def run(self):
+        try:
+            content_results = None
+            if not (self.content_reader_enabled and self.content_reader
+                    and self.search_results):
+                self.content_ready.emit([])
+                return
+
+            cr_cfg = config.load_config().get('content_reader', {})
+            max_chars = cr_cfg.get('max_chars_per_file', 5000)
+            top_n = min(len(self.search_results), 30)
+
+            file_paths = [item.get('full_path', '') for item in self.search_results[:top_n]
+                          if item.get('full_path', '')]
+            file_contents = self._read_files_parallel(file_paths, max_chars)
+
+            if file_contents and self.ai_summary_enabled:
+                content_results = self.agent.analyze_file_contents(file_contents, self.query)
+            elif file_contents:
+                content_results = []
+                for fp, txt in file_contents.items():
+                    name = os.path.basename(fp)
+                    snippet = txt[:200].replace('\n', ' ')
+                    content_results.append({
+                        'file_path': fp, 'file_name': name,
+                        'relevance': 0.5, 'reason': '内容匹配',
+                        'snippet': snippet if len(snippet) >= 50 else txt[:200]
+                    })
+
+            if content_results:
+                if self.not_relevant_cache and self.last_query:
+                    blocked = self.not_relevant_cache.get_blocked_paths(self.last_query)
+                    content_results = [r for r in content_results
+                                       if r.get('file_path', '').replace('\\', '/') not in blocked]
+
+            self.content_ready.emit(content_results or [])
+        except Exception as e:
+            logger.error(f"内容搜索失败: {e}")
+            self.content_ready.emit([])
 
     def _read_files_parallel(self, file_paths, max_chars):
-        """使用线程池并行读取多个文件内容，显著加速内容提取"""
         from concurrent.futures import ThreadPoolExecutor, as_completed
-
         valid_paths = [fp for fp in file_paths if fp and os.path.isfile(fp)]
-        if not valid_paths:
-            logger.info("内容搜索: 无有效文件路径可读取")
+        if not valid_paths or not self.content_reader:
             return {}
 
-        logger.info(f"内容搜索: 开始并行提取 {len(valid_paths)} 个文件的内容...")
         results = {}
-        success_count = 0
-        empty_count = 0
-        error_count = 0
         cr = self.content_reader
         with ThreadPoolExecutor(max_workers=4) as executor:
-            futures = {executor.submit(cr.read_content, fp, max_chars): fp
-                       for fp in valid_paths}
+            futures = {executor.submit(cr.read_content, fp, max_chars): fp for fp in valid_paths}
             for future in as_completed(futures):
                 fp = futures[future]
                 try:
                     text = future.result(timeout=10)
                     if text:
                         results[fp] = text
-                        success_count += 1
-                    else:
-                        empty_count += 1
-                except Exception as e:
-                    error_count += 1
-                    logger.debug(f"内容提取超时/异常: {os.path.basename(fp)}: {e}")
-        logger.info(f"内容搜索: 完成 — {success_count} 成功, {empty_count} 无内容, "
-                    f"{error_count} 失败, 共 {len(valid_paths)} 个文件")
+                except Exception:
+                    pass
         return results
 
-    def _append_content_results(self, content_results):
-        """追加内容搜索结果到已有结果下方（分批渲染）"""
-        if not content_results:
-            return
 
-        # 过滤非本项
-        if self._not_relevant_cache and self._last_query:
-            blocked = self._not_relevant_cache.get_blocked_paths(self._last_query)
-            content_results = [r for r in content_results
-                               if r.get('file_path', '').replace('\\', '/') not in blocked]
-        if not content_results:
-            return
+class TagWorker(QThread):
+    """后台标签操作工作线程"""
+    finished = Signal(dict)
 
-        # 分隔线
-        sep_frame = ctk.CTkFrame(self._results_frame, height=2, fg_color=_tc()['border'])
-        sep_frame.pack(fill='x', pady=8, padx=4)
+    def __init__(self, func, *args, **kwargs):
+        super().__init__()
+        self._func = func
+        self._args = args
+        self._kwargs = kwargs
 
-        ai_label = "🤖 AI智能分析" if self._ai_summary_enabled.get() else "📄 内容匹配"
-        content_label = ctk.CTkLabel(self._results_frame,
-                                      text=f"{ai_label} ({len(content_results)} 个)",
-                                      font=ctk.CTkFont(size=13, weight='bold'),
-                                      text_color='#27ae60')
-        content_label.pack(fill='x', pady=(4, 2), padx=4)
+    def run(self):
+        try:
+            result = self._func(*self._args, **self._kwargs)
+            self.finished.emit(result if isinstance(result, dict) else {"success": True, "message": str(result)})
+        except Exception as e:
+            self.finished.emit({"success": False, "message": str(e)})
 
-        BATCH_SIZE = 6
-        items = list(content_results)
-        idx = [0]
 
-        def _render_content_batch():
-            i = idx[0]
-            batch = items[i:i + BATCH_SIZE]
-            idx[0] += BATCH_SIZE
-            for item in batch:
-                self._create_content_result_item(item)
-            self._results_frame.update_idletasks()
-            if idx[0] < len(items):
-                self.after(16, _render_content_batch)  # ~60fps
+class IndexWaitWorker(QThread):
+    """后台等待 Everything 索引就绪"""
+    progress = Signal(float, int)
+    finished = Signal(bool)
 
-        _render_content_batch()
+    def __init__(self, search_engine, timeout=180, parent=None):
+        super().__init__(parent)
+        self.search_engine = search_engine
+        self.timeout = timeout
 
-    def _render_results(self, results, content_results=None):
-        """分批渲染搜索结果，避免一次性创建大量 widget 导致 UI 卡顿"""
-        for w in self._results_frame.winfo_children():
-            w.destroy()
+    def run(self):
+        def _progress(elapsed, total):
+            self.progress.emit(elapsed, total)
+        ok = self.search_engine.wait_for_index(timeout=self.timeout, progress_callback=_progress)
+        self.finished.emit(ok)
 
-        if not results and not content_results:
-            ctk.CTkLabel(self._results_frame, text="📂\n未找到匹配的文件",
-                          font=ctk.CTkFont(size=16), text_color=_tc()['text_dim'],
-                          justify='center').pack(pady=80)
-            return
 
-        # 区域一：文件名匹配结果（分批渲染）
-        if results:
-            name_label = ctk.CTkLabel(self._results_frame,
-                                       text=f"📁 文件名匹配 ({len(results)} 个)",
-                                       font=ctk.CTkFont(size=13, weight='bold'),
-                                       text_color='#4a90d9')
-            name_label.pack(fill='x', pady=(4, 2), padx=4)
+# ============ 自定义卡片组件 ============
+class FileResultCard(CardWidget):
+    """搜索结果文件卡片"""
+    double_clicked = Signal(str)
+    right_clicked = Signal(object, str, str)  # event, path, name
+    checked_changed = Signal(str, bool)       # path, checked
 
-            BATCH_SIZE = 8
-            items = list(results)
-            idx = [0]
+    def __init__(self, item, parent=None):
+        super().__init__(parent)
+        self.file_path = item.get('full_path', '')
+        self.setFixedHeight(64)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
 
-            def _render_name_batch():
-                i = idx[0]
-                batch = items[i:i + BATCH_SIZE]
-                idx[0] += BATCH_SIZE
-                for item in batch:
-                    self._create_result_item(item)
-                # 强制更新UI后再调度下一批
-                self._results_frame.update_idletasks()
-                if idx[0] < len(items):
-                    self.after(16, _render_name_batch)  # ~60fps
-                elif content_results:
-                    self._append_content_results(content_results)
-
-            _render_name_batch()
-        elif content_results:
-            self._append_content_results(content_results)
-
-    def _create_result_item(self, item):
-        row = ctk.CTkFrame(self._results_frame, corner_radius=8,
-                            border_width=1, border_color=_tc()['border_light'], height=56)
-        row.pack(fill='x', pady=2, padx=2)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setSpacing(8)
 
         # 复选框
-        fp = item.get('full_path', '')
-        is_selected = fp in self._selected_files
-
-        chk_var = ctk.BooleanVar(value=is_selected)
-        chk = ctk.CTkCheckBox(row, variable=chk_var, width=20, height=20, text="",
-                               checkbox_width=18, checkbox_height=18,
-                               command=lambda: self._toggle_file_selection(fp, chk_var.get()))
-        chk.pack(side='left', padx=(8, 4), pady=8)
+        self.checkbox = CheckBox()
+        self.checkbox.setFixedSize(20, 20)
+        fp = self.file_path
+        self.checkbox.stateChanged.connect(lambda s: self.checked_changed.emit(fp, s == Qt.CheckState.Checked.value))
+        layout.addWidget(self.checkbox)
 
         # 图标
         ext = item.get('extension', '')
         is_folder = item.get('is_folder', False)
-        icon = get_file_icon(ext, is_folder)
-        ctk.CTkLabel(row, text=icon, font=ctk.CTkFont(size=20), width=32).pack(side='left', padx=4)
+        icon_text = get_file_icon(ext, is_folder)
+        icon_label = BodyLabel(icon_text)
+        icon_label.setFixedWidth(32)
+        icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(icon_label)
 
         # 文件信息
-        info_frame = ctk.CTkFrame(row, fg_color='transparent')
-        info_frame.pack(side='left', fill='x', expand=True, padx=4, pady=6)
+        info_layout = QVBoxLayout()
+        info_layout.setSpacing(2)
 
         name_text = item.get('name', '')
-        ctk.CTkLabel(info_frame, text=name_text, font=ctk.CTkFont(size=14, weight='bold'),
-                      anchor='w').pack(fill='x')
+        name_label = BodyLabel(name_text)
+        name_label.setObjectName("fileNameLabel")
+        info_layout.addWidget(name_label)
 
         path_text = item.get('path', '')
-        ctk.CTkLabel(info_frame, text=path_text, font=ctk.CTkFont(size=11),
-                      text_color=_tc()['text_sec'], anchor='w').pack(fill='x')
+        path_label = CaptionLabel(path_text)
+        info_layout.addWidget(path_label)
+
+        layout.addLayout(info_layout, 1)
 
         # 标签
         tags = item.get('tags', [])
         if tags:
-            tags_frame = ctk.CTkFrame(row, fg_color='transparent')
-            tags_frame.pack(side='right', padx=8)
+            tags_layout = QHBoxLayout()
+            tags_layout.setSpacing(4)
             for tag in tags[:3]:
-                ctk.CTkButton(tags_frame, text=tag, width=len(tag)*8+16, height=22,
-                               fg_color=_tc()['accent_bg'], hover_color=_tc()['accent_hover'],
-                               text_color='#4a90d9', font=ctk.CTkFont(size=11),
-                               corner_radius=10,
-                               command=lambda t=tag: self._search_by_tag(t)).pack(side='left', padx=2)
+                tag_btn = TransparentPushButton(tag)
+                tag_btn.setFixedHeight(22)
+                tag_btn.clicked.connect(lambda checked=False, t=tag: self._on_tag_click(t))
+                tags_layout.addWidget(tag_btn)
+            layout.addLayout(tags_layout)
 
-        # 双击打开
-        self._bind_recursive(row, '<Double-Button-1>', lambda e: self._open_file(fp))
-        # 右键菜单
-        self._bind_recursive(row, '<Button-3>',
-                              lambda e, path=fp, name=item.get('name', ''): self._show_result_menu(e, path, name))
+    def _on_tag_click(self, tag):
+        """标签点击 — 信号由父级 SearchInterface 连接处理"""
+        pass
 
-    def _create_content_result_item(self, item):
-        """渲染内容相关的搜索结果项"""
+    def mouseDoubleClickEvent(self, event):
+        self.double_clicked.emit(self.file_path)
+        super().mouseDoubleClickEvent(event)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.RightButton:
+            self.right_clicked.emit(event, self.file_path,
+                                     self.findChild(BodyLabel, "fileNameLabel").text()
+                                     if self.findChild(BodyLabel, "fileNameLabel") else "")
+        super().mousePressEvent(event)
+
+
+class ContentResultCard(CardWidget):
+    """内容搜索结果卡片"""
+    double_clicked = Signal(str)
+    right_clicked = Signal(object, str, str)
+
+    def __init__(self, item, parent=None):
+        super().__init__(parent)
         fp = item.get('file_path', '')
-        file_name = item.get('file_name', '')
-        relevance = item.get('relevance', 0)
-        reason = item.get('reason', '')
-        snippet = item.get('snippet', '')
+        self.file_path = fp
+        self.setFixedHeight(80)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
 
-        row = ctk.CTkFrame(self._results_frame, corner_radius=8,
-                            border_width=1, border_color=_tc()['border_light'], height=64)
-        row.pack(fill='x', pady=2, padx=2)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(8, 4, 8, 4)
+        layout.setSpacing(8)
 
         # 相关性指示条
-        rel_color = '#27ae60' if relevance >= 0.7 else ('#f39c12' if relevance >= 0.4 else _tc()['text_sec'])
-        rel_bar = ctk.CTkFrame(row, width=4, fg_color=rel_color, corner_radius=2)
-        rel_bar.pack(side='left', fill='y', padx=(6, 6), pady=6)
+        relevance = item.get('relevance', 0)
+        rel_color = '#27ae60' if relevance >= 0.7 else ('#f39c12' if relevance >= 0.4 else '#a0a0a0')
+        rel_bar = QFrame()
+        rel_bar.setFixedWidth(4)
+        rel_bar.setStyleSheet(f"background-color: {rel_color}; border-radius: 2px;")
+        layout.addWidget(rel_bar)
 
-        # 文件图标
-        _, ext = os.path.splitext(file_name)
-        icon = get_file_icon(ext.lstrip('.').lower())
-        ctk.CTkLabel(row, text=icon, font=ctk.CTkFont(size=18), width=28).pack(side='left', padx=4)
+        # 图标
+        _, ext = os.path.splitext(item.get('file_name', ''))
+        icon_text = get_file_icon(ext.lstrip('.').lower())
+        icon_label = BodyLabel(icon_text)
+        icon_label.setFixedWidth(28)
+        icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(icon_label)
 
-        # 信息区
-        info_frame = ctk.CTkFrame(row, fg_color='transparent')
-        info_frame.pack(side='left', fill='x', expand=True, padx=4, pady=4)
+        # 信息
+        info_layout = QVBoxLayout()
+        info_layout.setSpacing(2)
 
-        # 文件名 + 相关性
-        name_frame = ctk.CTkFrame(info_frame, fg_color='transparent')
-        name_frame.pack(fill='x')
-        ctk.CTkLabel(name_frame, text=file_name, font=ctk.CTkFont(size=13, weight='bold'),
-                      anchor='w').pack(side='left')
-        rel_text = f"{relevance:.0%}" if relevance else ""
-        ctk.CTkLabel(name_frame, text=rel_text, font=ctk.CTkFont(size=11),
-                      text_color=rel_color).pack(side='left', padx=8)
+        name_frame = QHBoxLayout()
+        name_label = BodyLabel(item.get('file_name', ''))
+        name_label.setObjectName("contentFileName")
+        name_frame.addWidget(name_label)
 
-        # 原因
+        if relevance:
+            rel_text = f"{relevance:.0%}"
+            rel_label = CaptionLabel(rel_text)
+            rel_label.setStyleSheet(f"color: {rel_color};")
+            name_frame.addWidget(rel_label)
+        name_frame.addStretch()
+        info_layout.addLayout(name_frame)
+
+        reason = item.get('reason', '')
         if reason:
-            ctk.CTkLabel(info_frame, text=f"💡 {reason}", font=ctk.CTkFont(size=11),
-                          text_color='#4a90d9', anchor='w').pack(fill='x')
+            reason_label = CaptionLabel(f"💡 {reason}")
+            reason_label.setStyleSheet("color: #4a90d9;")
+            info_layout.addWidget(reason_label)
 
-        # 内容片段
+        snippet = item.get('snippet', '')
         if snippet:
-            disp_snippet = snippet[:120] + ('...' if len(snippet) > 120 else '')
-            ctk.CTkLabel(info_frame, text=disp_snippet, font=ctk.CTkFont(size=11),
-                          text_color=_tc()['text_sec'], anchor='w').pack(fill='x')
+            disp = snippet[:120] + ('...' if len(snippet) > 120 else '')
+            snippet_label = CaptionLabel(disp)
+            info_layout.addWidget(snippet_label)
 
-        # 路径
         dir_p = os.path.dirname(fp)
-        ctk.CTkLabel(info_frame, text=dir_p, font=ctk.CTkFont(size=10),
-                      text_color=_tc()['text_dim'], anchor='w').pack(fill='x')
+        dir_label = CaptionLabel(dir_p)
+        dir_label.setStyleSheet("color: #888;")
+        info_layout.addWidget(dir_label)
 
-        # 双击打开
-        self._bind_recursive(row, '<Double-Button-1>', lambda e: self._open_file(fp))
-        # 右键菜单
-        self._bind_recursive(row, '<Button-3>',
-                              lambda e, path=fp, name=file_name: self._show_result_menu(e, path, name))
+        layout.addLayout(info_layout, 1)
 
-    def _bind_recursive(self, widget, sequence, callback):
-        """递归绑定事件到 widget 及其所有子孙控件"""
-        try:
-            widget.bind(sequence, callback)
-        except Exception:
-            pass
-        for child in widget.winfo_children():
-            self._bind_recursive(child, sequence, callback)
+    def mouseDoubleClickEvent(self, event):
+        self.double_clicked.emit(self.file_path)
+        super().mouseDoubleClickEvent(event)
 
-    def _toggle_file_selection(self, fp, selected):
-        if selected:
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.RightButton:
+            self.right_clicked.emit(event, self.file_path,
+                                     self.findChild(BodyLabel, "contentFileName").text()
+                                     if self.findChild(BodyLabel, "contentFileName") else "")
+        super().mousePressEvent(event)
+
+
+class TagFileCard(CardWidget):
+    """标签文件卡片"""
+    double_clicked = Signal(str)
+
+    def __init__(self, item, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(48)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(8, 4, 8, 4)
+        layout.setSpacing(8)
+
+        ext = item.get('extension', '')
+        is_folder = item.get('is_folder', False)
+        icon_text = get_file_icon(ext, is_folder)
+        icon_label = BodyLabel(icon_text)
+        icon_label.setFixedWidth(28)
+        icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(icon_label)
+
+        info_layout = QVBoxLayout()
+        info_layout.setSpacing(1)
+        info_layout.addWidget(BodyLabel(item.get('name', '')))
+        info_layout.addWidget(CaptionLabel(item.get('path', '')))
+        layout.addLayout(info_layout, 1)
+
+    def mouseDoubleClickEvent(self, event):
+        self.double_clicked.emit(self.double_clicked)
+        super().mouseDoubleClickEvent(event)
+
+
+# ============ 搜索界面 ============
+class SearchInterface(QWidget):
+    """搜索主界面 — Fluent Design 风格"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("SearchInterface")
+
+        # 引用（由主窗口注入)
+        self._window = None
+
+        # 状态
+        self._search_results = []
+        self._selected_files = set()
+        self._active_filter = None
+        self._is_searching = False
+        self._ai_response_height = 140
+        self._last_search_result = {}
+        self._last_query = ""
+
+        self._setup_ui()
+
+    def set_window(self, win):
+        self._window = win
+
+    def _setup_ui(self):
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
+
+        # ===== 搜索区域 =====
+        search_section = QFrame()
+        search_layout = QVBoxLayout(search_section)
+        search_layout.setContentsMargins(16, 12, 16, 8)
+        search_layout.setSpacing(6)
+
+        # 搜索框行
+        search_box = QHBoxLayout()
+        self.search_input = SearchLineEdit()
+        self.search_input.setPlaceholderText("输入自然语言搜索，如：上周修改的PDF合同")
+        self.search_input.setFixedHeight(40)
+        self.search_input.searchSignal.connect(self._perform_search)
+        self.search_input.clearSignal.connect(lambda: self.search_input.setText(""))
+        search_box.addWidget(self.search_input, 1)
+
+        search_btn = PrimaryPushButton("搜索")
+        search_btn.setFixedSize(80, 40)
+        search_btn.clicked.connect(self._perform_search)
+        search_box.addWidget(search_btn)
+
+        search_layout.addLayout(search_box)
+
+        # 筛选条
+        filter_bar = QHBoxLayout()
+        filter_bar.setSpacing(4)
+
+        self._filter_buttons = {}
+        for name, query in FORMAT_FILTERS:
+            btn = TransparentPushButton(name)
+            btn.setFixedHeight(28)
+            btn.clicked.connect(lambda checked=False, q=query: self._toggle_filter(q))
+            filter_bar.addWidget(btn)
+            self._filter_buttons[query] = btn
+
+        filter_bar.addStretch()
+
+        # 功能开关
+        switch_frame = QHBoxLayout()
+        switch_frame.setSpacing(4)
+
+        _fs_cfg = config.load_config().get('search', config.DEFAULT_CONFIG.get('search', {}))
+        self._fast_search_enabled = _fs_cfg.get('fast_search', True)
+        self._fast_search_btn = TransparentPushButton("⚡ 简单搜索")
+        self._fast_search_btn.setFixedHeight(28)
+        self._fast_search_btn.clicked.connect(self._toggle_fast_search)
+        self._update_fast_search_style()
+        switch_frame.addWidget(self._fast_search_btn)
+
+        _cr_cfg = config.load_config().get('content_reader', config.DEFAULT_CONFIG.get('content_reader', {}))
+        self._content_reader_enabled = _cr_cfg.get('enabled', False)
+        self._content_reader_btn = TransparentPushButton("📄 内容搜索")
+        self._content_reader_btn.setFixedHeight(28)
+        self._content_reader_btn.clicked.connect(self._toggle_content_reader)
+        self._update_content_reader_style()
+        switch_frame.addWidget(self._content_reader_btn)
+
+        self._ai_summary_enabled = _cr_cfg.get('ai_summary_enabled', False)
+        self._ai_summary_btn = TransparentPushButton("🤖 AI总结")
+        self._ai_summary_btn.setFixedHeight(28)
+        self._ai_summary_btn.clicked.connect(self._toggle_ai_summary)
+        self._update_ai_summary_style()
+        switch_frame.addWidget(self._ai_summary_btn)
+
+        filter_bar.addLayout(switch_frame)
+        search_layout.addLayout(filter_bar)
+
+        main_layout.addWidget(search_section)
+
+        # ===== 标签操作栏（默认隐藏） =====
+        self.tag_action_bar = QFrame()
+        self.tag_action_bar.setFixedHeight(40)
+        self.tag_action_bar.setVisible(False)
+        tag_action_layout = QHBoxLayout(self.tag_action_bar)
+        tag_action_layout.setContentsMargins(12, 4, 12, 4)
+
+        self.selected_count_label = BodyLabel("0 个文件已选中")
+        self.selected_count_label.setStyleSheet("color: #4a90d9;")
+        tag_action_layout.addWidget(self.selected_count_label)
+
+        self.tag_input = LineEdit()
+        self.tag_input.setPlaceholderText("输入标签指令，如：标记为 高数资料")
+        self.tag_input.setFixedHeight(32)
+        self.tag_input.returnPressed.connect(self._apply_tags)
+        tag_action_layout.addWidget(self.tag_input, 1)
+
+        tag_btn = PrimaryPushButton("🏷 添加标签")
+        tag_btn.setFixedWidth(90)
+        tag_btn.clicked.connect(self._apply_tags)
+        tag_action_layout.addWidget(tag_btn)
+
+        main_layout.addWidget(self.tag_action_bar)
+
+        # ===== AI 回复区（默认隐藏） =====
+        self.ai_response_frame = QFrame()
+        self.ai_response_frame.setVisible(False)
+        self.ai_response_frame.setMinimumHeight(60)
+        ai_layout = QVBoxLayout(self.ai_response_frame)
+        ai_layout.setContentsMargins(12, 8, 12, 8)
+        ai_layout.setSpacing(4)
+
+        ai_header = QHBoxLayout()
+        ai_title = SubtitleLabel("🤖 AI 助手")
+        ai_title.setStyleSheet("color: #4a90d9;")
+        ai_header.addWidget(ai_title)
+
+        self.ai_detail_btn = TransparentPushButton("📋 查看详情")
+        self.ai_detail_btn.setFixedHeight(24)
+        self.ai_detail_btn.clicked.connect(self._show_ai_detail)
+        ai_header.addWidget(self.ai_detail_btn)
+        ai_header.addStretch()
+
+        close_btn = TransparentPushButton("✕")
+        close_btn.setFixedSize(24, 24)
+        close_btn.clicked.connect(self._hide_ai_response)
+        ai_header.addWidget(close_btn)
+        ai_layout.addLayout(ai_header)
+
+        self.ai_response_text = TextEdit()
+        self.ai_response_text.setReadOnly(True)
+        self.ai_response_text.setFixedHeight(self._ai_response_height)
+        ai_layout.addWidget(self.ai_response_text)
+
+        main_layout.addWidget(self.ai_response_frame)
+
+        # ===== 分隔条 =====
+        self.splitter_handle = QFrame()
+        self.splitter_handle.setFixedHeight(6)
+        self.splitter_handle.setCursor(Qt.CursorShape.SplitVCursor)
+        self.splitter_handle.setVisible(False)
+        self.splitter_handle.installEventFilter(self)
+        self._splitter_dragging = False
+        self._splitter_start_y = 0
+        self._splitter_start_height = 0
+        main_layout.addWidget(self.splitter_handle)
+
+        # ===== 结果区域 =====
+        results_section = QFrame()
+        results_layout = QVBoxLayout(results_section)
+        results_layout.setContentsMargins(16, 4, 16, 8)
+        results_layout.setSpacing(4)
+
+        # 结果头部
+        results_header = QHBoxLayout()
+        self.results_count_label = CaptionLabel("0 个结果")
+        results_header.addWidget(self.results_count_label)
+
+        self.query_label = CaptionLabel("")
+        results_header.addWidget(self.query_label)
+        results_header.addStretch()
+
+        # 排序按钮
+        self._sort_first_btn = TransparentPushButton("📁↑")
+        self._sort_first_btn.setFixedSize(36, 28)
+        self._sort_first_btn.clicked.connect(lambda: self._change_sort('first'))
+        results_header.addWidget(self._sort_first_btn)
+
+        self._sort_last_btn = TransparentPushButton("📁↓")
+        self._sort_last_btn.setFixedSize(36, 28)
+        self._sort_last_btn.clicked.connect(lambda: self._change_sort('last'))
+        results_header.addWidget(self._sort_last_btn)
+
+        self._sort_none_btn = TransparentPushButton("🚫")
+        self._sort_none_btn.setFixedSize(36, 28)
+        self._sort_none_btn.clicked.connect(lambda: self._change_sort('none'))
+        results_header.addWidget(self._sort_none_btn)
+
+        self._filter_toggle_btn = TransparentPushButton("🔽")
+        self._filter_toggle_btn.setFixedSize(36, 28)
+        self._filter_toggle_btn.clicked.connect(self._toggle_search_filter)
+        results_header.addWidget(self._filter_toggle_btn)
+
+        self._update_sort_buttons()
+        self._update_search_filter_btn()
+
+        results_layout.addLayout(results_header)
+
+        # 结果滚动区
+        self._results_scroll = SmoothScrollArea()
+        self._results_scroll.setWidgetResizable(True)
+        self._results_container = QWidget()
+        self._results_layout = QVBoxLayout(self._results_container)
+        self._results_layout.setSpacing(4)
+        self._results_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self._results_scroll.setWidget(self._results_container)
+
+        # 空状态
+        self._empty_label = BodyLabel("🔍\n输入关键词开始搜索")
+        self._empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._empty_label.setStyleSheet("color: #888; padding: 80px;")
+        self._results_layout.addWidget(self._empty_label)
+
+        results_layout.addWidget(self._results_scroll, 1)
+        main_layout.addWidget(results_section, 1)
+
+    def eventFilter(self, obj, event):
+        if obj == self.splitter_handle:
+            if event.type() == QEvent.Type.MouseButtonPress:
+                self._splitter_dragging = True
+                self._splitter_start_y = event.globalPosition().y()
+                self._splitter_start_height = self._ai_response_height
+                return True
+            elif event.type() == QEvent.Type.MouseMove and self._splitter_dragging:
+                delta = event.globalPosition().y() - self._splitter_start_y
+                new_h = max(60, min(400, int(self._splitter_start_height + delta)))
+                if new_h != self._ai_response_height:
+                    self._ai_response_height = new_h
+                    self.ai_response_text.setFixedHeight(new_h)
+                return True
+            elif event.type() == QEvent.Type.MouseButtonRelease:
+                self._splitter_dragging = False
+                return True
+            elif event.type() == QEvent.Type.MouseButtonDblClick:
+                self._ai_response_height = 140
+                self.ai_response_text.setFixedHeight(140)
+                return True
+        return super().eventFilter(obj, event)
+
+    def _perform_search(self):
+        if self._is_searching:
+            return
+        win = self._window
+        if not win or not win.agent:
+            return
+
+        query = self.search_input.text().strip()
+        if not query:
+            InfoBar.warning(title="提示", content="请输入搜索内容", parent=self)
+            return
+
+        full_query = query
+        if self._active_filter:
+            full_query = query + ' ' + self._active_filter
+
+        self._is_searching = True
+        self._last_query = full_query
+        self.results_count_label.setText("搜索中...")
+        self._hide_ai_response()
+        self._clear_results()
+
+        # 显示加载状态
+        loading = BodyLabel("⏳ 搜索中...")
+        loading.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        loading.setStyleSheet("padding: 40px;")
+        self._results_layout.addWidget(loading)
+
+        self.search_input.setEnabled(False)
+
+        # 启动搜索线程
+        fast_mode = self._fast_search_enabled
+        self._search_worker = SearchWorker(win.agent, full_query, fast_mode)
+        self._search_worker.finished.connect(self._on_search_finished)
+        self._search_worker.start()
+
+    def _on_search_finished(self, result):
+        self._is_searching = False
+        self.search_input.setEnabled(True)
+        self._last_search_result = result
+
+        # 批量查询标签
+        if result.get('success') and result.get('results') and self._window and self._window.tag_manager:
+            fps = [item.get('full_path', '') for item in result['results']
+                   if item.get('full_path') and 'tags' not in item]
+            if fps:
+                tag_map = self._window.tag_manager.get_tags_batch(fps)
+                for item in result['results']:
+                    fp = item.get('full_path', '')
+                    if fp in tag_map:
+                        item['tags'] = tag_map[fp]
+
+        self._render_search_results(result)
+
+        # 非本项过滤
+        raw_results = result.get('results', [])
+        query = self._last_query
+        if self._window and self._window._not_relevant_cache and query:
+            blocked = self._window._not_relevant_cache.get_blocked_paths(query)
+            self._search_results = [r for r in raw_results
+                                    if r.get('full_path', '').replace('\\', '/') not in blocked]
+        else:
+            self._search_results = raw_results
+
+        # 内容搜索
+        if 'content_results' in result and result['content_results']:
+            self._append_content_results(result['content_results'])
+        elif (self._content_reader_enabled and self._window and self._window.content_reader
+              and result.get('success') and result.get('results')):
+            self._content_worker = ContentSearchWorker(
+                self._window.agent, self._window.content_reader,
+                result['results'], self._last_query,
+                self._content_reader_enabled, self._ai_summary_enabled,
+                self._window._not_relevant_cache, self._last_query
+            )
+            self._content_worker.content_ready.connect(self._append_content_results)
+            self._content_worker.start()
+
+    def _render_search_results(self, result):
+        self._clear_results()
+
+        if result.get('success'):
+            results = result.get('results', [])
+            query = self._last_query
+            if self._window and self._window._not_relevant_cache and query:
+                blocked = self._window._not_relevant_cache.get_blocked_paths(query)
+                results = [r for r in results
+                           if r.get('full_path', '').replace('\\', '/') not in blocked]
+            self._search_results = results
+            total = len(results)
+            self.results_count_label.setText(f"{total} 个结果")
+            self.query_label.setText(self._last_query)
+
+            if results:
+                name_label = BodyLabel(f"📁 文件名匹配 ({total} 个)")
+                name_label.setStyleSheet("color: #4a90d9; font-weight: bold;")
+                self._results_layout.addWidget(name_label)
+
+                # 分批渲染
+                self._render_batch(results, 0, 8, is_content=False)
+            else:
+                empty = BodyLabel("📂\n未找到匹配的文件")
+                empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                empty.setStyleSheet("padding: 80px; color: #888;")
+                self._results_layout.addWidget(empty)
+
+            if result.get('message'):
+                self._show_ai_response(result['message'])
+        else:
+            self.results_count_label.setText("搜索失败")
+            err = BodyLabel(f"❌ {result.get('error', '搜索失败')}")
+            err.setStyleSheet("color: #e74c3c; padding: 40px;")
+            err.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._results_layout.addWidget(err)
+
+    def _render_batch(self, items, start, batch_size, is_content=False):
+        batch = items[start:start + batch_size]
+        for item in batch:
+            if is_content:
+                card = ContentResultCard(item)
+                card.double_clicked.connect(self._open_file)
+                card.right_clicked.connect(self._show_result_menu)
+            else:
+                card = FileResultCard(item)
+                card.double_clicked.connect(self._open_file)
+                card.right_clicked.connect(self._show_result_menu)
+                card.checked_changed.connect(self._on_file_checked)
+                fp = item.get('full_path', '')
+                if fp in self._selected_files:
+                    card.checkbox.setChecked(True)
+            self._results_layout.addWidget(card)
+
+        next_start = start + batch_size
+        if next_start < len(items):
+            QTimer.singleShot(16, lambda: self._render_batch(items, next_start, batch_size, is_content))
+
+    def _append_content_results(self, content_results):
+        if not content_results:
+            return
+
+        # 分隔线
+        sep = HorizontalSeparator()
+        self._results_layout.addWidget(sep)
+
+        ai_label = "🤖 AI智能分析" if self._ai_summary_enabled else "📄 内容匹配"
+        content_label = BodyLabel(f"{ai_label} ({len(content_results)} 个)")
+        content_label.setStyleSheet("color: #27ae60; font-weight: bold;")
+        self._results_layout.addWidget(content_label)
+
+        self._render_batch(content_results, 0, 6, is_content=True)
+
+    def _clear_results(self):
+        while self._results_layout.count() > 0:
+            item = self._results_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+    def _on_file_checked(self, fp, checked):
+        if checked:
             self._selected_files.add(fp)
         else:
             self._selected_files.discard(fp)
 
         count = len(self._selected_files)
         if count > 0:
-            self._selected_count_label.configure(text=f"{count} 个文件已选中")
-            self._tag_action_bar.pack(fill='x', before=self._ai_response_frame if self._ai_response_frame.winfo_manager() else self._results_section)
+            self.selected_count_label.setText(f"{count} 个文件已选中")
+            self.tag_action_bar.setVisible(True)
         else:
-            self._tag_action_bar.pack_forget()
+            self.tag_action_bar.setVisible(False)
 
     def _apply_tags(self):
-        instruction = self._tag_input_var.get().strip()
+        instruction = self.tag_input.text().strip()
         if not instruction:
-            self.toast.show("请输入标签指令", "warning")
+            InfoBar.warning(title="提示", content="请输入标签指令", parent=self)
             return
         if not self._selected_files:
-            self.toast.show("请先选中文件", "warning")
+            InfoBar.warning(title="提示", content="请先选中文件", parent=self)
             return
 
         file_paths = list(self._selected_files)
+        win = self._window
+        if not win or not win.agent:
+            return
 
-        def _do():
-            try:
-                result = self.agent.process(instruction, {"selected_files": file_paths})
-                self.after(0, lambda: self.toast.show(result.get('message', '操作成功'), 'success' if result.get('success') else 'error'))
-                self.after(0, lambda: self._tag_input_var.set(''))
-            except Exception as e:
-                self.after(0, lambda: self.toast.show(f"操作出错: {e}", 'error'))
+        worker = TagWorker(win.agent.process, instruction, {"selected_files": file_paths})
+        worker.finished.connect(lambda r: self._on_tag_result(r, instruction))
+        worker.start()
 
-        threading.Thread(target=_do, daemon=True).start()
+    def _on_tag_result(self, result, instruction):
+        if result.get('success'):
+            InfoBar.success(title="成功", content=result.get('message', '操作成功'), parent=self)
+            self.tag_input.clear()
+        else:
+            InfoBar.error(title="失败", content=result.get('message', '操作失败'), parent=self)
 
     def _toggle_filter(self, query):
         if self._active_filter == query:
             self._active_filter = None
-            for btn, q in self._filter_buttons:
-                btn.configure(fg_color='transparent', text_color=_tc()['text_sec'], border_width=1)
+            for q, btn in self._filter_buttons.items():
+                btn.setStyleSheet("")
         else:
             self._active_filter = query
-            for btn, q in self._filter_buttons:
+            for q, btn in self._filter_buttons.items():
                 if q == query:
-                    btn.configure(fg_color=_tc()['accent_bg'], text_color='#4a90d9', border_width=0)
+                    btn.setStyleSheet("QPushButton { color: #4a90d9; font-weight: bold; }")
                 else:
-                    btn.configure(fg_color='transparent', text_color=_tc()['text_sec'], border_width=1)
+                    btn.setStyleSheet("")
 
-        if self._search_var.get().strip():
+        if self.search_input.text().strip():
             self._perform_search()
 
     def _change_sort(self, order):
-        self._search_filters['folder_sort_order'] = order
-        btn_map = {'first': self._sort_first_btn, 'last': self._sort_last_btn, 'none': self._sort_none_btn}
-        for o, b in btn_map.items():
-            if o == order:
-                b.configure(fg_color=_tc()['accent_bg'], text_color='#4a90d9')
-            else:
-                b.configure(fg_color='transparent', text_color=_tc()['text_sec'])
-        self._save_search_filters()
-        if self._search_var.get().strip():
+        if self._window:
+            self._window._search_filters['folder_sort_order'] = order
+            self._window._save_search_filters()
+        self._update_sort_buttons()
+        if self.search_input.text().strip():
             self._perform_search()
 
+    def _update_sort_buttons(self):
+        order = 'first'
+        if self._window:
+            order = self._window._search_filters.get('folder_sort_order', 'first')
+        for btn in [self._sort_first_btn, self._sort_last_btn, self._sort_none_btn]:
+            btn.setStyleSheet("")
+        active = {'first': self._sort_first_btn, 'last': self._sort_last_btn,
+                  'none': self._sort_none_btn}.get(order)
+        if active:
+            active.setStyleSheet("QPushButton { color: #4a90d9; font-weight: bold; }")
+
     def _toggle_search_filter(self):
-        self._search_filters['enabled'] = not self._search_filters['enabled']
-        if self._search_filters['enabled']:
-            self._filter_toggle_btn.configure(fg_color=_tc()['accent_bg'], text_color='#4a90d9')
+        if self._window:
+            self._window._search_filters['enabled'] = not self._window._search_filters.get('enabled', True)
+            self._window._save_search_filters()
+            enabled = self._window._search_filters['enabled']
+            msg = "过滤器已启用" if enabled else "过滤器已关闭"
+            InfoBar.info(title="过滤器", content=msg, parent=self)
+            self._update_search_filter_btn()
+
+    def _update_search_filter_btn(self):
+        enabled = True
+        if self._window:
+            enabled = self._window._search_filters.get('enabled', True)
+        if enabled:
+            self._filter_toggle_btn.setStyleSheet("QPushButton { color: #4a90d9; font-weight: bold; }")
         else:
-            self._filter_toggle_btn.configure(fg_color='transparent', text_color=_tc()['text_sec'])
-        self._save_search_filters()
-        self.toast.show("过滤器已" + ("启用" if self._search_filters['enabled'] else "关闭"), 'info')
+            self._filter_toggle_btn.setStyleSheet("")
 
     def _toggle_fast_search(self):
-        """切换简单搜索开关（控制是否跳过 AI 直接规则搜索）"""
-        self._fast_search_enabled.set(not self._fast_search_enabled.get())
-        enabled = self._fast_search_enabled.get()
-        if enabled:
-            self._fast_search_btn.configure(fg_color=_tc()['accent_bg'], text_color='#4a90d9')
-            self.toast.show("简单搜索已启用（直接匹配文件名）", 'info')
-        else:
-            self._fast_search_btn.configure(fg_color='transparent', text_color=_tc()['text_sec'])
-            self.toast.show("AI 智能搜索已启用", 'info')
+        self._fast_search_enabled = not self._fast_search_enabled
+        self._update_fast_search_style()
         self._save_fast_search_config()
+        msg = "简单搜索已启用" if self._fast_search_enabled else "AI 智能搜索已启用"
+        InfoBar.info(title="搜索模式", content=msg, parent=self)
+
+    def _update_fast_search_style(self):
+        if self._fast_search_enabled:
+            self._fast_search_btn.setStyleSheet("QPushButton { color: #4a90d9; font-weight: bold; }")
+        else:
+            self._fast_search_btn.setStyleSheet("")
 
     def _save_fast_search_config(self):
-        """保存简单搜索配置"""
         cfg = config.load_config()
         cfg.setdefault('search', {})
-        cfg['search']['fast_search'] = self._fast_search_enabled.get()
+        cfg['search']['fast_search'] = self._fast_search_enabled
         config.save_config(cfg)
 
     def _toggle_content_reader(self):
-        """切换文档内容搜索开关"""
-        self._content_reader_enabled.set(not self._content_reader_enabled.get())
-        enabled = self._content_reader_enabled.get()
-        if enabled:
-            self._content_reader_btn.configure(fg_color=_tc()['accent_bg'], text_color='#4a90d9')
-            if not self.content_reader:
-                self.content_reader = ContentReader()
-            # 同步 ContentReader 的 enabled 状态
-            if self.content_reader:
-                self.content_reader.enabled = True
-            self.toast.show("内容搜索已启用", 'info')
-        else:
-            self._content_reader_btn.configure(fg_color='transparent', text_color=_tc()['text_sec'])
-            if self.content_reader:
-                self.content_reader.enabled = False
-            self.toast.show("内容搜索已关闭", 'info')
+        self._content_reader_enabled = not self._content_reader_enabled
+        self._update_content_reader_style()
         self._save_content_reader_config()
+        win = self._window
+        if win and self._content_reader_enabled and not win.content_reader:
+            win.content_reader = ContentReader()
+        if win and win.content_reader:
+            win.content_reader.enabled = self._content_reader_enabled
+        msg = "内容搜索已启用" if self._content_reader_enabled else "内容搜索已关闭"
+        InfoBar.info(title="内容搜索", content=msg, parent=self)
+
+    def _update_content_reader_style(self):
+        if self._content_reader_enabled:
+            self._content_reader_btn.setStyleSheet("QPushButton { color: #4a90d9; font-weight: bold; }")
+        else:
+            self._content_reader_btn.setStyleSheet("")
 
     def _toggle_ai_summary(self):
-        """切换 AI 总结开关"""
-        self._ai_summary_enabled.set(not self._ai_summary_enabled.get())
-        enabled = self._ai_summary_enabled.get()
-        if enabled:
-            self._ai_summary_btn.configure(fg_color=_tc()['accent_bg'], text_color='#4a90d9')
-            self.toast.show("AI 总结已启用", 'info')
-        else:
-            self._ai_summary_btn.configure(fg_color='transparent', text_color=_tc()['text_sec'])
-            self.toast.show("AI 总结已关闭", 'info')
+        self._ai_summary_enabled = not self._ai_summary_enabled
+        self._update_ai_summary_style()
         self._save_content_reader_config()
+        msg = "AI 总结已启用" if self._ai_summary_enabled else "AI 总结已关闭"
+        InfoBar.info(title="AI总结", content=msg, parent=self)
+
+    def _update_ai_summary_style(self):
+        if self._ai_summary_enabled:
+            self._ai_summary_btn.setStyleSheet("QPushButton { color: #4a90d9; font-weight: bold; }")
+        else:
+            self._ai_summary_btn.setStyleSheet("")
 
     def _save_content_reader_config(self):
-        """保存内容搜索相关配置"""
         cfg = config.load_config()
         cfg.setdefault('content_reader', {})
-        cfg['content_reader']['enabled'] = self._content_reader_enabled.get()
-        cfg['content_reader']['ai_summary_enabled'] = self._ai_summary_enabled.get()
+        cfg['content_reader']['enabled'] = self._content_reader_enabled
+        cfg['content_reader']['ai_summary_enabled'] = self._ai_summary_enabled
         config.save_config(cfg)
 
-    def _update_content_toggle_buttons(self):
-        """更新内容搜索和AI总结按钮的样式"""
-        if self._content_reader_enabled.get():
-            self._content_reader_btn.configure(fg_color=_tc()['accent_bg'], text_color='#4a90d9')
-        else:
-            self._content_reader_btn.configure(fg_color='transparent', text_color=_tc()['text_sec'])
+    def update_content_toggle_buttons(self):
+        self._update_content_reader_style()
+        self._update_ai_summary_style()
 
-        if self._ai_summary_enabled.get():
-            self._ai_summary_btn.configure(fg_color=_tc()['accent_bg'], text_color='#4a90d9')
-        else:
-            self._ai_summary_btn.configure(fg_color='transparent', text_color=_tc()['text_sec'])
+    def _show_ai_response(self, message):
+        self.ai_response_text.setPlainText(message)
+        self.ai_response_frame.setVisible(True)
+        self.splitter_handle.setVisible(True)
+        self.ai_response_text.setFixedHeight(self._ai_response_height)
 
-    def _save_search_filters(self):
-        cfg = config.load_config()
-        cfg['search_filters'] = self._search_filters
-        config.save_config(cfg)
+    def _hide_ai_response(self):
+        self.ai_response_frame.setVisible(False)
+        self.splitter_handle.setVisible(False)
+
+    def _show_ai_detail(self):
+        dialog = Dialog("AI 回复详情", self._window if self._window else self)
+        dialog.setMinimumSize(700, 550)
+
+        layout = QVBoxLayout(dialog)
+
+        title = SubtitleLabel("🤖 AI 交互详情")
+        layout.addWidget(title)
+
+        result = self._last_search_result
+
+        # 概要
+        summary_card = SimpleCardWidget()
+        summary_layout = QVBoxLayout(summary_card)
+        success = result.get('success', False)
+        status = "✅ 成功" if success else "❌ 失败"
+        status_color = '#27ae60' if success else '#e74c3c'
+        sl = BodyLabel(f"状态: {status}")
+        sl.setStyleSheet(f"color: {status_color}; font-weight: bold;")
+        summary_layout.addWidget(sl)
+        summary_layout.addWidget(BodyLabel(f"结果数: {result.get('total', 0)}"))
+        summary_layout.addWidget(BodyLabel(f"消息: {result.get('message', '无')}"))
+        if result.get('error'):
+            summary_layout.addWidget(BodyLabel(f"错误: {result['error']}"))
+        if result.get('from_cache'):
+            summary_layout.addWidget(BodyLabel("📦 缓存命中"))
+        layout.addWidget(summary_card)
+
+        # 工具调用记录
+        actions = result.get('actions', [])
+        if actions:
+            layout.addWidget(SubtitleLabel("🔧 工具调用记录"))
+
+            actions_scroll = SmoothScrollArea()
+            actions_container = QWidget()
+            actions_layout = QVBoxLayout(actions_container)
+            actions_layout.setSpacing(4)
+            actions_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+
+            for i, a in enumerate(actions):
+                card = SimpleCardWidget()
+                card_layout = QVBoxLayout(card)
+                card_layout.setSpacing(2)
+
+                tool_name = a.get('tool', '未知')
+                tl = BodyLabel(f"#{i+1} {tool_name}")
+                tl.setStyleSheet("color: #4a90d9; font-weight: bold;")
+                card_layout.addWidget(tl)
+
+                if a.get('args'):
+                    args_text = json.dumps(a['args'], ensure_ascii=False, indent=2)
+                    card_layout.addWidget(CaptionLabel(args_text))
+
+                summary = a.get('result_summary', '')
+                if summary:
+                    card_layout.addWidget(BodyLabel(f"结果: {summary}"))
+                actions_layout.addWidget(card)
+
+            actions_scroll.setWidget(actions_container)
+            layout.addWidget(actions_scroll, 1)
+        else:
+            layout.addWidget(BodyLabel("(无工具调用记录)"))
+
+        # 底部
+        bottom = QHBoxLayout()
+        try:
+            from ai_response_logger import get_log_file_path
+            bottom.addWidget(CaptionLabel(f"📋 完整日志: {get_log_file_path()}"))
+        except Exception:
+            pass
+        bottom.addStretch()
+        close_btn = PrimaryPushButton("关闭")
+        close_btn.clicked.connect(dialog.close)
+        bottom.addWidget(close_btn)
+        layout.addLayout(bottom)
+
+        dialog.exec()
+
+    def _show_result_menu(self, event, file_path, file_name):
+        menu = QMenu(self)
+        menu.addAction("📂 打开文件", lambda: self._open_file(file_path))
+        menu.addAction("📁 浏览路径", lambda: self._open_file_location(file_path))
+        menu.addSeparator()
+        menu.addAction("🏷 编辑标签", lambda: self._edit_tags_for_file(file_path, file_name))
+        menu.addAction("✏ 重命名", lambda: self._rename_file(file_path, file_name))
+        menu.addSeparator()
+        menu.addAction("🗑 非本项", lambda: self._mark_not_relevant(file_path, file_name))
+        menu.exec(event.globalPos() if hasattr(event, 'globalPos') else event.globalPosition().toPoint())
 
     def _open_file(self, fp):
         try:
             if os.path.exists(fp):
                 os.startfile(fp)
             else:
-                self.toast.show(f"文件不存在: {fp}", 'error')
+                InfoBar.error(title="错误", content=f"文件不存在: {fp}", parent=self)
         except Exception as e:
-            self.toast.show(f"打开失败: {e}", 'error')
-
-    def _show_result_menu(self, event, file_path, file_name=""):
-        """右键菜单"""
-        popup = Menu(self, tearoff=0)
-
-        popup.add_command(label="📂 打开文件", command=lambda: self._open_file(file_path))
-        popup.add_command(label="📁 浏览路径",
-                          command=lambda: self._open_file_location(file_path))
-        popup.add_separator()
-        popup.add_command(label="🏷 编辑标签",
-                          command=lambda: self._edit_tags_for_file(file_path, file_name))
-        popup.add_command(label="✏ 重命名",
-                          command=lambda: self._rename_file(file_path, file_name))
-        popup.add_separator()
-        popup.add_command(label="🗑 非本项",
-                          command=lambda: self._mark_not_relevant(file_path, file_name))
-
-        try:
-            popup.tk_popup(event.x_root, event.y_root)
-        finally:
-            popup.grab_release()
+            InfoBar.error(title="错误", content=f"打开失败: {e}", parent=self)
 
     def _open_file_location(self, fp):
-        """在资源管理器中浏览路径"""
         try:
             dir_p = os.path.dirname(fp)
             if os.path.isdir(dir_p):
                 if os.path.exists(fp):
                     os.system(f'explorer /select,"{fp}"')
-                elif os.path.isdir(dir_p):
+                else:
                     os.startfile(dir_p)
-            else:
-                self.toast.show(f"路径不存在: {dir_p}", 'error')
         except Exception as e:
-            self.toast.show(f"打开路径失败: {e}", 'error')
+            InfoBar.error(title="错误", content=f"打开路径失败: {e}", parent=self)
 
     def _edit_tags_for_file(self, fp, file_name=""):
-        """为单个文件编辑标签 — 弹出标签编辑对话框"""
+        win = self._window
         current_tags = []
-        if self.tag_manager:
+        if win and win.tag_manager:
             try:
-                current_tags = self.tag_manager.get_tags(fp)
+                current_tags = win.tag_manager.get_tags(fp)
             except Exception:
                 pass
 
-        dialog = ctk.CTkToplevel(self)
-        dialog.title(f"编辑标签 - {file_name or os.path.basename(fp)}")
-        dialog.geometry("480x320")
-        dialog.transient(self)
-        dialog.grab_set()
+        dialog = Dialog(f"编辑标签 - {file_name or os.path.basename(fp)}", win if win else self)
+        dialog.setMinimumSize(480, 320)
+        layout = QVBoxLayout(dialog)
 
-        ctk.CTkLabel(dialog, text=f"文件: {file_name or os.path.basename(fp)}",
-                      font=ctk.CTkFont(size=13, weight='bold')).pack(pady=(12, 8), padx=16, anchor='w')
+        layout.addWidget(BodyLabel(f"文件: {file_name or os.path.basename(fp)}"))
 
-        ctk.CTkLabel(dialog, text="当前标签:",
-                      font=ctk.CTkFont(size=12)).pack(anchor='w', padx=16)
+        tags_text = ", ".join(current_tags) if current_tags else "(无标签)"
+        layout.addWidget(BodyLabel(f"当前标签: {tags_text}"))
 
-        tags_frame = ctk.CTkFrame(dialog, fg_color=_tc()['accent_bg'])
-        tags_frame.pack(fill='x', padx=16, pady=4)
+        layout.addWidget(BodyLabel("新标签（逗号分隔，以 - 开头表示删除）:"))
+        entry = LineEdit()
+        entry.setPlaceholderText("例如: 重要, 工作, -旧标签")
+        layout.addWidget(entry)
 
-        current_label = ctk.CTkLabel(tags_frame, text=", ".join(current_tags) if current_tags else "(无标签)",
-                                      font=ctk.CTkFont(size=12), text_color=_tc()['text_sec'])
-        current_label.pack(padx=8, pady=6)
-
-        ctk.CTkLabel(dialog, text="新标签（逗号分隔，以 - 开头表示删除）:",
-                      font=ctk.CTkFont(size=12)).pack(anchor='w', padx=16, pady=(12, 4))
-
-        entry = ctk.CTkEntry(dialog, placeholder_text="例如: 重要, 工作, -旧标签", height=36)
-        entry.pack(fill='x', padx=16, pady=4)
-
-        status_label = ctk.CTkLabel(dialog, text="", font=ctk.CTkFont(size=11),
-                                     text_color=_tc()['text_sec'])
+        status_label = CaptionLabel("")
+        layout.addWidget(status_label)
 
         def _apply():
-            instruction = entry.get().strip()
+            instruction = entry.text().strip()
             if not instruction:
                 return
-            if self.agent:
-                def _do():
-                    try:
-                        result = self.agent.process(instruction, {"selected_files": [fp]})
-                        self.after(0, lambda: _on_result(result))
-                    except Exception as ex:
-                        self.after(0, lambda: status_label.configure(
-                            text=f"失败: {ex}", text_color='#e74c3c'))
-                        self.after(0, lambda: status_label.pack(anchor='w', padx=16))
+            if win and win.agent:
+                worker = TagWorker(win.agent.process, instruction, {"selected_files": [fp]})
+                worker.finished.connect(lambda r: _on_result(r))
+                worker.start()
 
-                def _on_result(res):
-                    if res.get('success'):
-                        self.toast.show("标签已更新", 'success')
-                        dialog.destroy()
-                        # 刷新当前结果显示中的标签
-                        self._refresh_result_tags(fp)
-                    else:
-                        status_label.configure(
-                            text=f"失败: {res.get('message', res.get('error', '未知错误'))}",
-                            text_color='#e74c3c')
-                        status_label.pack(anchor='w', padx=16)
+        def _on_result(res):
+            if res.get('success'):
+                InfoBar.success(title="成功", content="标签已更新", parent=self)
+                dialog.close()
+            else:
+                status_label.setText(f"失败: {res.get('message', res.get('error', '未知错误'))}")
+                status_label.setStyleSheet("color: #e74c3c;")
 
-                threading.Thread(target=_do, daemon=True).start()
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        cancel_btn = TransparentPushButton("取消")
+        cancel_btn.clicked.connect(dialog.close)
+        btn_layout.addWidget(cancel_btn)
+        save_btn = PrimaryPushButton("保存")
+        save_btn.clicked.connect(_apply)
+        btn_layout.addWidget(save_btn)
+        layout.addLayout(btn_layout)
 
-        btn_frame = ctk.CTkFrame(dialog, fg_color='transparent')
-        btn_frame.pack(fill='x', padx=16, pady=(12, 8))
-        ctk.CTkButton(btn_frame, text="保存", command=_apply,
-                       width=80).pack(side='right', padx=4)
-        ctk.CTkButton(btn_frame, text="取消", command=dialog.destroy,
-                       width=80, fg_color='transparent', hover_color=_tc()['bg_hover'],
-                       text_color=_tc()['text_sec']).pack(side='right', padx=4)
-        status_label.pack_forget()
-
-    def _refresh_result_tags(self, fp):
-        """刷新某个文件在结果列表中的标签显示"""
-        if not self.tag_manager:
-            return
-        try:
-            new_tags = self.tag_manager.get_tags(fp)
-        except Exception:
-            return
-        for item in self._search_results:
-            if item.get('full_path', '') == fp:
-                item['tags'] = new_tags
-                break
+        dialog.exec()
 
     def _rename_file(self, fp, file_name=""):
-        """重命名文件"""
-        dialog = ctk.CTkToplevel(self)
-        dialog.title("重命名文件")
-        dialog.geometry("450x180")
-        dialog.transient(self)
-        dialog.grab_set()
-
+        win = self._window
         original_name = file_name or os.path.basename(fp)
         dir_p = os.path.dirname(fp)
 
-        ctk.CTkLabel(dialog, text=f"路径: {dir_p}",
-                      font=ctk.CTkFont(size=11), text_color=_tc()['text_sec'],
-                      wraplength=410).pack(anchor='w', padx=16, pady=(12, 4))
+        dialog = Dialog("重命名文件", win if win else self)
+        dialog.setMinimumSize(450, 180)
+        layout = QVBoxLayout(dialog)
 
-        ctk.CTkLabel(dialog, text="新文件名:",
-                      font=ctk.CTkFont(size=12)).pack(anchor='w', padx=16)
+        layout.addWidget(CaptionLabel(f"路径: {dir_p}"))
+        layout.addWidget(BodyLabel("新文件名:"))
+        name_entry = LineEdit()
+        name_entry.setText(original_name)
+        name_entry.selectAll()
+        layout.addWidget(name_entry)
 
-        name_entry = ctk.CTkEntry(dialog, height=36)
-        name_entry.insert(0, original_name)
-        name_entry.pack(fill='x', padx=16, pady=4)
-        name_entry.select_range(0, len(os.path.splitext(original_name)[0]))
-        name_entry.focus_set()
-
-        status_label = ctk.CTkLabel(dialog, text="", font=ctk.CTkFont(size=11))
+        status_label = CaptionLabel("")
+        layout.addWidget(status_label)
 
         def _do_rename():
-            new_name = name_entry.get().strip()
+            new_name = name_entry.text().strip()
             if not new_name or new_name == original_name:
-                dialog.destroy()
+                dialog.close()
                 return
             new_path = os.path.join(dir_p, new_name)
             if os.path.exists(new_path) and os.path.normpath(new_path) != os.path.normpath(fp):
-                status_label.configure(text="目标文件已存在！", text_color='#e74c3c')
-                status_label.pack(anchor='w', padx=16, pady=2)
+                status_label.setText("目标文件已存在！")
+                status_label.setStyleSheet("color: #e74c3c;")
                 return
             try:
                 os.rename(fp, new_path)
-                dialog.destroy()
-                self.toast.show(f"已重命名为 {new_name}", 'success')
-                # 更新标签存储中的路径
-                if self.tag_manager:
+                dialog.close()
+                InfoBar.success(title="成功", content=f"已重命名为 {new_name}", parent=self)
+                if win and win.tag_manager:
                     try:
-                        self.tag_manager.update_path(fp, new_path)
+                        win.tag_manager.update_path(fp, new_path)
                     except Exception:
                         pass
-                # 刷新结果
                 for item in self._search_results:
                     if item.get('full_path', '') == fp:
                         item['full_path'] = new_path
@@ -1230,526 +1263,715 @@ class FaindApp(ctk.CTk):
                         _, ext = os.path.splitext(new_name)
                         item['extension'] = ext.lstrip('.').lower()
                         break
-                # 重新渲染当页结果
-                self._render_results(self._search_results)
+                self._render_search_results({'success': True, 'results': self._search_results, 'total': len(self._search_results)})
             except OSError as e:
-                status_label.configure(text=f"重命名失败: {e}", text_color='#e74c3c')
-                status_label.pack(anchor='w', padx=16, pady=2)
+                status_label.setText(f"重命名失败: {e}")
+                status_label.setStyleSheet("color: #e74c3c;")
 
-        btn_frame = ctk.CTkFrame(dialog, fg_color='transparent')
-        btn_frame.pack(fill='x', padx=16, pady=(12, 8))
-        ctk.CTkButton(btn_frame, text="重命名", command=_do_rename,
-                       width=80).pack(side='right', padx=4)
-        ctk.CTkButton(btn_frame, text="取消", command=dialog.destroy,
-                       width=80, fg_color='transparent', hover_color=_tc()['bg_hover'],
-                       text_color=_tc()['text_sec']).pack(side='right', padx=4)
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        cancel_btn = TransparentPushButton("取消")
+        cancel_btn.clicked.connect(dialog.close)
+        btn_layout.addWidget(cancel_btn)
+        ok_btn = PrimaryPushButton("重命名")
+        ok_btn.clicked.connect(_do_rename)
+        btn_layout.addWidget(ok_btn)
+        layout.addLayout(btn_layout)
+
+        dialog.exec()
 
     def _mark_not_relevant(self, fp, file_name=""):
-        """标记为非本项，加入缓存并从当次结果中移除"""
-        if not self._not_relevant_cache or not self._last_query:
-            self.toast.show("无法标记，缺少搜索上下文", 'warning')
+        win = self._window
+        if not win or not win._not_relevant_cache or not self._last_query:
+            InfoBar.warning(title="提示", content="无法标记，缺少搜索上下文", parent=self)
             return
-
-        self._not_relevant_cache.mark_not_relevant(self._last_query, fp)
+        win._not_relevant_cache.mark_not_relevant(self._last_query, fp)
         name = file_name or os.path.basename(fp)
-
-        # 从当前结果列表中移除
         before = len(self._search_results)
         self._search_results = [r for r in self._search_results
                                 if r.get('full_path', '').replace('\\', '/') != fp.replace('\\', '/')]
-        after = len(self._search_results)
+        if len(self._search_results) < before:
+            self._render_search_results({'success': True, 'results': self._search_results,
+                                         'total': len(self._search_results)})
+            self.results_count_label.setText(f"{len(self._search_results)} 个结果")
+            InfoBar.info(title="已标记", content=f"已标记为非本项: {name}", parent=self)
 
-        if after < before:
-            self._render_results(self._search_results)
-            self._results_count_label.configure(text=f"{after} 个结果")
-            self.toast.show(f"已标记为非本项: {name}", 'info')
 
-    def _search_by_tag(self, tag):
-        self._search_var.set(f"标签:{tag}")
-        self._switch_view('search')
+# ============ 标签管理界面 ============
+class TagsInterface(QWidget):
+    """标签管理界面"""
 
-        def _do():
-            try:
-                paths = self.tag_manager.search_by_tag(tag)
-                results = []
-                for p in paths:
-                    name = os.path.basename(p)
-                    dir_p = os.path.dirname(p)
-                    _, ext = os.path.splitext(name)
-                    results.append({'name': name, 'path': dir_p, 'full_path': p,
-                                    'extension': ext.lstrip('.').lower(),
-                                    'tags': self.tag_manager.get_tags(p),
-                                    'is_folder': os.path.isdir(p) if os.path.exists(p) else False})
-                self.after(0, lambda: self._on_search_done({'success': True, 'results': results, 'total': len(results)}, f"标签: {tag}"))
-            except Exception as e:
-                self.after(0, lambda: self._on_search_error(str(e)))
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("TagsInterface")
+        self._window = None
 
-        threading.Thread(target=_do, daemon=True).start()
+        self._setup_ui()
 
-    def _show_ai_response(self, message):
-        self._ai_response_text.configure(state='normal')
-        self._ai_response_text.delete('1.0', 'end')
-        self._ai_response_text.insert('1.0', message)
-        self._ai_response_text.configure(state='disabled')
-        self._splitter_handle.pack(fill='x', before=self._results_section, pady=0)
-        self._ai_response_frame.pack(fill='x', before=self._splitter_handle)
-        self._ai_response_frame.configure(height=self._ai_response_height)
-        self._ai_response_frame.pack_propagate(False)
+    def set_window(self, win):
+        self._window = win
 
-    def _hide_ai_response(self):
-        self._ai_response_frame.pack_forget()
-        self._ai_response_frame.pack_propagate(True)
-        self._splitter_handle.pack_forget()
+    def _setup_ui(self):
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
 
-    def _toggle_ai_response_size(self, event=None):
-        """双击分隔条恢复默认高度"""
-        self._ai_response_height = 140
-        self._ai_response_frame.configure(height=self._ai_response_height)
+        # ===== 左侧标签栏 =====
+        sidebar = QFrame()
+        sidebar.setFixedWidth(240)
+        sidebar_layout = QVBoxLayout(sidebar)
+        sidebar_layout.setContentsMargins(8, 8, 8, 8)
+        sidebar_layout.setSpacing(6)
 
-    def _on_splitter_press(self, event):
-        self._splitter_dragging = True
-        self._splitter_start_y = event.y_root
-        self._splitter_start_height = self._ai_response_height
-        self._splitter_handle.configure(fg_color=_tc()['accent'])
+        sidebar_layout.addWidget(SubtitleLabel("🏷 标签管理"))
 
-    def _on_splitter_drag(self, event):
-        if not self._splitter_dragging:
+        self.tag_search_input = LineEdit()
+        self.tag_search_input.setPlaceholderText("搜索标签...")
+        self.tag_search_input.setFixedHeight(32)
+        self.tag_search_input.textChanged.connect(self._filter_tags)
+        sidebar_layout.addWidget(self.tag_search_input)
+
+        sidebar_layout.addWidget(StrongBodyLabel("自定义标签"))
+        self.custom_tags_scroll = SmoothScrollArea()
+        self.custom_tags_container = QWidget()
+        self.custom_tags_layout = QVBoxLayout(self.custom_tags_container)
+        self.custom_tags_layout.setSpacing(2)
+        self.custom_tags_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.custom_tags_scroll.setWidget(self.custom_tags_container)
+        sidebar_layout.addWidget(self.custom_tags_scroll, 1)
+
+        sidebar_layout.addWidget(StrongBodyLabel("格式标签"))
+        fmt_frame = QWidget()
+        fmt_layout = QVBoxLayout(fmt_frame)
+        fmt_layout.setSpacing(1)
+        for name, query in FORMAT_FILTERS:
+            btn = TransparentPushButton(name)
+            btn.setFixedHeight(28)
+            btn.clicked.connect(lambda checked=False, q=query, n=name: self._select_format_tag(q, n))
+            fmt_layout.addWidget(btn)
+        sidebar_layout.addWidget(fmt_frame)
+
+        create_btn = PrimaryPushButton("＋ 新建标签")
+        create_btn.clicked.connect(self._show_create_tag)
+        sidebar_layout.addWidget(create_btn)
+
+        layout.addWidget(sidebar)
+
+        # ===== 右侧内容区 =====
+        content = QFrame()
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(16, 12, 16, 12)
+        content_layout.setSpacing(8)
+
+        content_header = QHBoxLayout()
+        self.tag_content_title = SubtitleLabel("选择一个标签查看文件")
+        content_header.addWidget(self.tag_content_title)
+        self.tag_file_count = CaptionLabel("")
+        content_header.addWidget(self.tag_file_count)
+        content_header.addStretch()
+        content_layout.addLayout(content_header)
+
+        # AI 操作栏
+        ai_bar = QHBoxLayout()
+        self.tag_ai_input = LineEdit()
+        self.tag_ai_input.setPlaceholderText("AI标签指令：如 '给所有PDF添加文档标签'")
+        self.tag_ai_input.setFixedHeight(32)
+        self.tag_ai_input.returnPressed.connect(self._execute_tag_ai)
+        ai_bar.addWidget(self.tag_ai_input, 1)
+        exec_btn = PrimaryPushButton("🤖 执行")
+        exec_btn.setFixedWidth(70)
+        exec_btn.clicked.connect(self._execute_tag_ai)
+        ai_bar.addWidget(exec_btn)
+        content_layout.addLayout(ai_bar)
+
+        # 文件列表
+        self.tag_file_scroll = SmoothScrollArea()
+        self.tag_file_container = QWidget()
+        self.tag_file_layout = QVBoxLayout(self.tag_file_container)
+        self.tag_file_layout.setSpacing(4)
+        self.tag_file_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.tag_file_scroll.setWidget(self.tag_file_container)
+
+        self.tag_empty_label = BodyLabel("🏷\n从左侧选择标签查看关联文件")
+        self.tag_empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.tag_empty_label.setStyleSheet("padding: 80px;")
+        self.tag_file_layout.addWidget(self.tag_empty_label)
+
+        content_layout.addWidget(self.tag_file_scroll, 1)
+        layout.addWidget(content, 1)
+
+    def refresh_tags_sidebar(self):
+        win = self._window
+        if not win or not win.tag_manager:
             return
-        delta = event.y_root - self._splitter_start_y
-        new_height = max(60, min(400, self._splitter_start_height + delta))
-        if new_height != self._ai_response_height:
-            self._ai_response_height = new_height
-            self._ai_response_frame.configure(height=new_height)
+        worker = TagWorker(win.tag_manager.get_all_tags)
+        worker.finished.connect(self._render_custom_tags)
+        worker.start()
 
-    def _on_splitter_release(self, event):
-        self._splitter_dragging = False
-        self._splitter_handle.configure(fg_color=_tc()['border'])
+    def _render_custom_tags(self, result):
+        # 清除旧内容
+        while self.custom_tags_layout.count() > 0:
+            item = self.custom_tags_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
 
-    def _show_ai_detail(self):
-        """弹出 AI 回复详情窗口"""
-        dialog = ctk.CTkToplevel(self)
-        dialog.title("AI 回复详情")
-        dialog.geometry("700x550")
-        dialog.transient(self)
-        dialog.grab_set()
-
-        ctk.CTkLabel(dialog, text="🤖 AI 交互详情", font=ctk.CTkFont(size=16, weight='bold')).pack(pady=12)
-
-        # 结果概要
-        result = getattr(self, '_last_search_result', {})
-        summary_frame = ctk.CTkFrame(dialog)
-        summary_frame.pack(fill='x', padx=16, pady=(0, 8))
-
-        success = result.get('success', False)
-        status_text = "✅ 成功" if success else "❌ 失败"
-        status_color = '#27ae60' if success else '#e74c3c'
-        ctk.CTkLabel(summary_frame, text=f"状态: {status_text}",
-                      text_color=status_color, font=ctk.CTkFont(size=13, weight='bold')).pack(anchor='w', padx=8, pady=4)
-
-        ctk.CTkLabel(summary_frame, text=f"结果数: {result.get('total', 0)}",
-                      font=ctk.CTkFont(size=12)).pack(anchor='w', padx=8)
-        ctk.CTkLabel(summary_frame, text=f"消息: {result.get('message', '无')}",
-                      font=ctk.CTkFont(size=12), wraplength=650).pack(anchor='w', padx=8, pady=2)
-        if result.get('error'):
-            ctk.CTkLabel(summary_frame, text=f"错误: {result.get('error', '')}",
-                          text_color='#e74c3c', font=ctk.CTkFont(size=12),
-                          wraplength=650).pack(anchor='w', padx=8, pady=2)
-        if result.get('from_cache'):
-            ctk.CTkLabel(summary_frame, text="📦 缓存命中",
-                          text_color='#4a90d9', font=ctk.CTkFont(size=12)).pack(anchor='w', padx=8)
-
-        # AI 工具调用详情
-        actions = result.get('actions', [])
-        if actions:
-            ctk.CTkLabel(dialog, text="🔧 工具调用记录",
-                          font=ctk.CTkFont(size=14, weight='bold')).pack(anchor='w', padx=16, pady=(12, 4))
-
-            actions_frame = ctk.CTkScrollableFrame(dialog, height=250)
-            actions_frame.pack(fill='both', expand=True, padx=16, pady=(0, 8))
-
-            for i, a in enumerate(actions):
-                action_row = ctk.CTkFrame(actions_frame, corner_radius=6,
-                                           border_width=1, border_color=_tc()['border'])
-                action_row.pack(fill='x', pady=2)
-
-                tool_name = a.get('tool', '未知')
-                ctk.CTkLabel(action_row, text=f"#{i+1} {tool_name}",
-                              font=ctk.CTkFont(size=12, weight='bold'),
-                              text_color='#4a90d9').pack(anchor='w', padx=8, pady=(4, 0))
-
-                if a.get('args'):
-                    args_text = json.dumps(a['args'], ensure_ascii=False, indent=2)
-                    ctk.CTkLabel(action_row, text=args_text,
-                                  font=ctk.CTkFont(family='Courier', size=11),
-                                  text_color=_tc()['text_sec'],
-                                  justify='left', wraplength=600).pack(anchor='w', padx=16, pady=2)
-
-                summary = a.get('result_summary', '')
-                if summary:
-                    ctk.CTkLabel(action_row, text=f"结果: {summary}",
-                                  font=ctk.CTkFont(size=11),
-                                  text_color=_tc()['text_dark']).pack(anchor='w', padx=8, pady=(0, 4))
-        else:
-            ctk.CTkLabel(dialog, text="(无工具调用记录)",
-                          font=ctk.CTkFont(size=12),
-                          text_color=_tc()['text_dim']).pack(pady=16)
-
-        # 日志文件路径提示
-        try:
-            from ai_response_logger import get_log_file_path
-            log_path = get_log_file_path()
-            ctk.CTkLabel(dialog, text=f"📋 完整日志: {log_path}",
-                          font=ctk.CTkFont(size=11),
-                          text_color=_tc()['text_dim']).pack(side='left', padx=16, pady=8)
-        except Exception:
-            pass
-
-        ctk.CTkButton(dialog, text="关闭", command=dialog.destroy,
-                       width=80).pack(side='right', padx=16, pady=12)
-
-    # ============ 标签管理功能 ============
-    def _refresh_tags_sidebar(self):
-        if not self.tag_manager:
-            return
-
-        def _do():
-            try:
-                tags = self.tag_manager.get_all_tags()
-                self.after(0, lambda: self._render_custom_tags(tags or []))
-            except Exception as e:
-                print(f"[Faind] 刷新标签失败: {e}")
-
-        threading.Thread(target=_do, daemon=True).start()
-
-    def _render_custom_tags(self, tags):
-        for w in self._custom_tags_frame.winfo_children():
-            w.destroy()
-
+        tags = result.get('tags', []) if isinstance(result, dict) else (result or [])
         if not tags:
-            ctk.CTkLabel(self._custom_tags_frame, text="暂无标签",
-                          font=ctk.CTkFont(size=12), text_color=_tc()['text_dim']).pack(pady=8)
+            self.custom_tags_layout.addWidget(CaptionLabel("暂无标签"))
             return
 
         for tag in tags:
-            row = ctk.CTkFrame(self._custom_tags_frame, fg_color='transparent', height=32)
-            row.pack(fill='x', pady=1)
+            row = QHBoxLayout()
+            btn = TransparentPushButton(f"🏷 {tag}")
+            btn.setFixedHeight(28)
+            btn.clicked.connect(lambda checked=False, t=tag: self._select_tag(t))
+            row.addWidget(btn, 1)
 
-            ctk.CTkButton(row, text=f"🏷 {tag}", fg_color='transparent', hover_color=_tc()['bg_hover'],
-                           text_color=_tc()['text_dark'], anchor='w', font=ctk.CTkFont(size=12),
-                           height=28, command=lambda t=tag: self._select_tag(t)).pack(side='left', fill='x', expand=True)
+            rename_btn = TransparentPushButton("✏")
+            rename_btn.setFixedSize(24, 24)
+            rename_btn.clicked.connect(lambda checked=False, t=tag: self._show_rename_tag(t))
+            row.addWidget(rename_btn)
 
-            # 重命名和删除按钮
-            ctk.CTkButton(row, text="✏", width=24, height=24, fg_color='transparent',
-                           hover_color=_tc()['bg_hover'], font=ctk.CTkFont(size=10),
-                           command=lambda t=tag: self._show_rename_tag(t)).pack(side='right', padx=1)
+            del_btn = TransparentPushButton("🗑")
+            del_btn.setFixedSize(24, 24)
+            del_btn.clicked.connect(lambda checked=False, t=tag: self._delete_tag(t))
+            row.addWidget(del_btn)
 
-            ctk.CTkButton(row, text="🗑", width=24, height=24, fg_color='transparent',
-                           hover_color='#fde8e8', text_color='#e74c3c', font=ctk.CTkFont(size=10),
-                           command=lambda t=tag: self._delete_tag(t)).pack(side='right', padx=1)
+            row_widget = QWidget()
+            row_widget.setLayout(row)
+            self.custom_tags_layout.addWidget(row_widget)
 
-    def _filter_tags_sidebar(self):
-        query = self._tag_search_var.get().strip().lower()
-        if not self.tag_manager:
+    def _filter_tags(self, text):
+        win = self._window
+        if not win or not win.tag_manager:
             return
-        tags = self.tag_manager.get_all_tags() or []
-        filtered = [t for t in tags if query in t.lower()]
-        self._render_custom_tags(filtered)
+        tags = win.tag_manager.get_all_tags() or []
+        if text:
+            tags = [t for t in tags if text.strip().lower() in t.lower()]
+        self._render_custom_tags({'tags': tags})
 
     def _select_tag(self, tag):
-        self._tag_content_title.configure(text=f"🏷 {tag}")
+        self.tag_content_title.setText(f"🏷 {tag}")
+        win = self._window
+        if not win or not win.tag_manager:
+            return
 
-        def _do():
-            try:
-                paths = self.tag_manager.search_by_tag(tag)
-                results = []
-                for p in paths:
-                    name = os.path.basename(p)
-                    dir_p = os.path.dirname(p)
-                    _, ext = os.path.splitext(name)
-                    results.append({'name': name, 'path': dir_p, 'full_path': p,
-                                    'extension': ext.lstrip('.').lower(),
-                                    'tags': self.tag_manager.get_tags(p),
-                                    'is_folder': os.path.isdir(p) if os.path.exists(p) else False})
-                self.after(0, lambda: self._render_tag_files(results, f"{len(results)} 个文件"))
-            except Exception as e:
-                self.after(0, lambda: self.toast.show(f"加载失败: {e}", 'error'))
+        worker = TagWorker(win.tag_manager.search_by_tag, tag)
+        worker.finished.connect(lambda r: self._on_tag_search_done(tag, r))
+        worker.start()
 
-        threading.Thread(target=_do, daemon=True).start()
+    def _on_tag_search_done(self, tag, result):
+        paths = result.get('results', []) if isinstance(result, dict) else (result or [])
+        paths = paths if isinstance(paths, list) else []
+        results = []
+        win = self._window
+        for p in paths:
+            name = os.path.basename(p)
+            dir_p = os.path.dirname(p)
+            _, ext = os.path.splitext(name)
+            results.append({
+                'name': name, 'path': dir_p, 'full_path': p,
+                'extension': ext.lstrip('.').lower(),
+                'tags': win.tag_manager.get_tags(p) if win and win.tag_manager else [],
+                'is_folder': os.path.isdir(p) if os.path.exists(p) else False
+            })
+        self._render_tag_files(results, f"{len(results)} 个文件")
 
     def _select_format_tag(self, ext_query, name):
-        self._tag_content_title.configure(text=f"📄 格式: {name}")
+        self.tag_content_title.setText(f"📄 格式: {name}")
+        win = self._window
+        if not win or not win.agent:
+            return
+        worker = SearchWorker(win.agent, ext_query, fast_mode=True)
+        worker.finished.connect(lambda r: self._on_format_search_done(r))
+        worker.start()
 
-        def _do():
-            try:
-                result = self.agent.process(ext_query, fast_mode=True)
-                if result.get('success'):
-                    items = result.get('results', [])
-                    self.after(0, lambda: self._render_tag_files(items, f"{result.get('total', 0)} 个文件"))
-            except Exception as e:
-                self.after(0, lambda: self.toast.show(f"搜索失败: {e}", 'error'))
-
-        threading.Thread(target=_do, daemon=True).start()
+    def _on_format_search_done(self, result):
+        if result.get('success'):
+            items = result.get('results', [])
+            self._render_tag_files(items, f"{result.get('total', 0)} 个文件")
 
     def _render_tag_files(self, results, count_text):
-        self._tag_file_count.configure(text=count_text)
-        for w in self._tag_file_frame.winfo_children():
-            w.destroy()
+        self.tag_file_count.setText(count_text)
+
+        while self.tag_file_layout.count() > 0:
+            item = self.tag_file_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
 
         if not results:
-            ctk.CTkLabel(self._tag_file_frame, text="📂\n该标签下暂无文件",
-                          font=ctk.CTkFont(size=16), text_color=_tc()['text_dim'],
-                          justify='center').pack(pady=80)
+            self.tag_file_layout.addWidget(self.tag_empty_label)
             return
 
         for item in results:
-            row = ctk.CTkFrame(self._tag_file_frame, corner_radius=8,
-                                border_width=1, border_color=_tc()['border_light'], height=48)
-            row.pack(fill='x', pady=2, padx=2)
+            card = TagFileCard(item)
+            card.double_clicked.connect(lambda fp=item.get('full_path', ''): self._open_file(fp))
+            self.tag_file_layout.addWidget(card)
 
-            ext = item.get('extension', '')
-            is_folder = item.get('is_folder', False)
-            icon = get_file_icon(ext, is_folder)
-            ctk.CTkLabel(row, text=icon, font=ctk.CTkFont(size=18), width=28).pack(side='left', padx=(8, 4))
-
-            info = ctk.CTkFrame(row, fg_color='transparent')
-            info.pack(side='left', fill='x', expand=True, padx=4, pady=4)
-            ctk.CTkLabel(info, text=item.get('name', ''), font=ctk.CTkFont(size=13, weight='bold'),
-                          anchor='w').pack(fill='x')
-            ctk.CTkLabel(info, text=item.get('path', ''), font=ctk.CTkFont(size=11),
-                          text_color=_tc()['text_sec'], anchor='w').pack(fill='x')
-
-            fp = item.get('full_path', '')
-            row.bind('<Double-Button-1>', lambda e, p=fp: self._open_file(p))
+    def _open_file(self, fp):
+        try:
+            if os.path.exists(fp):
+                os.startfile(fp)
+        except Exception as e:
+            InfoBar.error(title="错误", content=f"打开失败: {e}", parent=self)
 
     def _delete_tag(self, tag):
-        if not self.tag_manager:
-            return
-        # 简单确认
-        dialog = ctk.CTkInputDialog(text=f"确定删除标签 \"{tag}\" 吗？\n输入 YES 确认：",
-                                     title="删除标签")
-        if dialog.get_input() != "YES":
+        win = self._window
+        if not win or not win.tag_manager:
             return
 
-        def _do():
-            try:
-                result = self.tag_manager.delete_tag(tag)
-                self.after(0, lambda: self.toast.show(result.get('message', '已删除'), 'success' if result.get('success') else 'error'))
-                self.after(0, self._refresh_tags_sidebar)
-            except Exception as e:
-                self.after(0, lambda: self.toast.show(f"删除出错: {e}", 'error'))
+        if MessageBox("删除标签", f"确定删除标签 \"{tag}\" 吗？", self).exec():
+            worker = TagWorker(win.tag_manager.delete_tag, tag)
+            worker.finished.connect(lambda r: self._on_tag_deleted(r, tag))
+            worker.start()
 
-        threading.Thread(target=_do, daemon=True).start()
+    def _on_tag_deleted(self, result, tag):
+        if result.get('success'):
+            InfoBar.success(title="成功", content=f"标签 \"{tag}\" 已删除", parent=self)
+        else:
+            InfoBar.error(title="失败", content=result.get('message', '删除失败'), parent=self)
+        self.refresh_tags_sidebar()
+
+    def _show_create_tag(self):
+        dialog = Dialog("新建标签", self._window if self._window else self)
+        dialog.setMinimumSize(350, 150)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(BodyLabel("输入新标签名称："))
+        entry = LineEdit()
+        layout.addWidget(entry)
+
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        cancel_btn = TransparentPushButton("取消")
+        cancel_btn.clicked.connect(dialog.close)
+        btn_layout.addWidget(cancel_btn)
+        ok_btn = PrimaryPushButton("创建")
+        btn_layout.addWidget(ok_btn)
+        layout.addLayout(btn_layout)
+
+        def _create():
+            name = entry.text().strip()
+            if name:
+                win = self._window
+                if win and win.agent:
+                    worker = TagWorker(win.agent.process, name, {"selected_files": ["__create_tag__"]})
+                    worker.finished.connect(lambda r: self._on_tag_created(r, name, dialog))
+                    worker.start()
+
+        ok_btn.clicked.connect(_create)
+        entry.returnPressed.connect(_create)
+        dialog.exec()
+
+    def _on_tag_created(self, result, name, dialog):
+        if result.get('success'):
+            InfoBar.success(title="成功", content=f"标签 \"{name}\" 已创建", parent=self)
+            dialog.close()
+            self.refresh_tags_sidebar()
+        else:
+            InfoBar.error(title="失败", content=result.get('message', '创建失败'), parent=self)
+
+    def _show_rename_tag(self, old_name):
+        dialog = Dialog(f"重命名标签 \"{old_name}\"", self._window if self._window else self)
+        dialog.setMinimumSize(350, 150)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(BodyLabel(f"重命名标签 \"{old_name}\" 为："))
+        entry = LineEdit()
+        layout.addWidget(entry)
+
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        cancel_btn = TransparentPushButton("取消")
+        cancel_btn.clicked.connect(dialog.close)
+        btn_layout.addWidget(cancel_btn)
+        ok_btn = PrimaryPushButton("重命名")
+        btn_layout.addWidget(ok_btn)
+        layout.addLayout(btn_layout)
+
+        def _rename():
+            new_name = entry.text().strip()
+            if new_name and new_name != old_name:
+                win = self._window
+                if win and win.tag_manager:
+                    worker = TagWorker(win.tag_manager.rename_tag, old_name, new_name)
+                    worker.finished.connect(lambda r: self._on_tag_renamed(r, new_name, dialog))
+                    worker.start()
+
+        ok_btn.clicked.connect(_rename)
+        entry.returnPressed.connect(_rename)
+        dialog.exec()
+
+    def _on_tag_renamed(self, result, new_name, dialog):
+        if result.get('success'):
+            InfoBar.success(title="成功", content=f"已重命名为 \"{new_name}\"", parent=self)
+            dialog.close()
+            self.refresh_tags_sidebar()
+        else:
+            InfoBar.error(title="失败", content=result.get('message', '重命名失败'), parent=self)
 
     def _execute_tag_ai(self):
-        instruction = self._tag_ai_var.get().strip()
+        instruction = self.tag_ai_input.text().strip()
         if not instruction:
-            self.toast.show("请输入AI标签指令", "warning")
+            InfoBar.warning(title="提示", content="请输入AI标签指令", parent=self)
             return
-        self._tag_ai_var.set('')
-        self.toast.show("正在执行...", 'info')
+        self.tag_ai_input.clear()
+        InfoBar.info(title="AI标签", content="正在执行...", parent=self)
 
-        def _do():
-            try:
-                result = self.agent.process(instruction)
-                self.after(0, lambda: self.toast.show(result.get('message', '操作完成'),
-                             'success' if result.get('success') else 'error'))
-                self.after(0, self._refresh_tags_sidebar)
-            except Exception as e:
-                self.after(0, lambda: self.toast.show(f"操作出错: {e}", 'error'))
+        win = self._window
+        if win and win.agent:
+            worker = TagWorker(win.agent.process, instruction)
+            worker.finished.connect(lambda r: self._on_tag_ai_done(r))
+            worker.start()
 
-        threading.Thread(target=_do, daemon=True).start()
-
-    # ============ 弹窗 ============
-    def _show_history(self):
-        dialog = ctk.CTkToplevel(self)
-        dialog.title("搜索历史")
-        dialog.geometry("400x500")
-        dialog.transient(self)
-        dialog.grab_set()
-
-        ctk.CTkLabel(dialog, text="搜索历史", font=ctk.CTkFont(size=16, weight='bold')).pack(pady=12)
-
-        scroll = ctk.CTkScrollableFrame(dialog, fg_color='transparent')
-        scroll.pack(fill='both', expand=True, padx=16)
-
-        if self._search_history:
-            for q in self._search_history:
-                ctk.CTkButton(scroll, text=q, fg_color='transparent', hover_color=_tc()['bg_hover'],
-                               text_color=_tc()['text_dark'], anchor='w', font=ctk.CTkFont(size=13),
-                               command=lambda query=q: (self._search_var.set(query), dialog.destroy(), self._perform_search())).pack(fill='x', pady=2)
+    def _on_tag_ai_done(self, result):
+        if result.get('success'):
+            InfoBar.success(title="成功", content=result.get('message', '操作完成'), parent=self)
         else:
-            ctk.CTkLabel(scroll, text="暂无搜索历史", text_color=_tc()['text_dim']).pack(pady=40)
+            InfoBar.error(title="失败", content=result.get('message', '操作失败'), parent=self)
+        self.refresh_tags_sidebar()
 
-        btn_frame = ctk.CTkFrame(dialog, fg_color='transparent')
-        btn_frame.pack(fill='x', padx=16, pady=12)
-        ctk.CTkButton(btn_frame, text="清空历史", fg_color='transparent',
-                       hover_color='#fde8e8', text_color='#e74c3c',
-                       command=lambda: (self._search_history.clear(), dialog.destroy())).pack(side='left')
-        ctk.CTkButton(btn_frame, text="关闭", command=dialog.destroy).pack(side='right')
 
-    def _show_settings(self):
-        dialog = ctk.CTkToplevel(self)
-        dialog.title("设置")
-        dialog.geometry("520x600")
-        dialog.transient(self)
-        dialog.grab_set()
+# ============ 设置界面 ============
+class SettingsInterface(QWidget):
+    """设置界面 — 使用设置卡片"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("SettingsInterface")
+        self._window = None
+
+        self._setup_ui()
+
+    def set_window(self, win):
+        self._window = win
+
+    def _make_group(self, title):
+        """创建紧凑的设置分组"""
+        group = QWidget()
+        group.setStyleSheet("QWidget { background: transparent; }")
+        glayout = QVBoxLayout(group)
+        glayout.setContentsMargins(0, 0, 0, 0)
+        glayout.setSpacing(4)
+        label = BodyLabel(title)
+        label.setStyleSheet("font-size: 15px; font-weight: bold; padding: 4px 0;")
+        glayout.addWidget(label)
+        cards = QWidget()
+        cards.setObjectName("settingCards")
+        cards_layout = QVBoxLayout(cards)
+        cards_layout.setContentsMargins(0, 0, 0, 0)
+        cards_layout.setSpacing(2)
+        glayout.addWidget(cards)
+        return group, cards_layout
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 12, 16, 12)
+        layout.setSpacing(12)
+
+        title = TitleLabel("⚙ 设置")
+        layout.addWidget(title)
+
+        scroll = SmoothScrollArea()
+        scroll.setWidgetResizable(True)
+        container = QWidget()
+        container_layout = QVBoxLayout(container)
+        container_layout.setContentsMargins(0, 0, 0, 0)
+        container_layout.setSpacing(12)
 
         cfg = config.load_config()
 
-        scroll = ctk.CTkScrollableFrame(dialog, fg_color='transparent')
-        scroll.pack(fill='both', expand=True, padx=16, pady=8)
+        # ===== AI 设置 =====
+        ai_group, ai_cards = self._make_group("🤖 AI 设置")
+        ai_enabled = cfg.get('ai', {}).get('enabled', True)
+        self._ai_enabled_card, self._ai_enabled_switch = self._make_switch_card(
+            FluentIcon.ROBOT, "启用 AI", "", ai_enabled)
+        ai_cards.addWidget(self._ai_enabled_card)
 
-        # AI 设置
-        ctk.CTkLabel(scroll, text="🤖 AI 设置", font=ctk.CTkFont(size=14, weight='bold')).pack(anchor='w', pady=(8, 4))
+        self.base_url_edit = LineEdit()
+        self.base_url_edit.setText(cfg.get('ai', {}).get('base_url', ''))
+        self.base_url_edit.setPlaceholderText("https://api.deepseek.com")
+        ai_cards.addWidget(self._make_edit_card("API 端点", self.base_url_edit))
 
-        ai_enabled = ctk.BooleanVar(value=cfg.get('ai', {}).get('enabled', True))
-        ctk.CTkCheckBox(scroll, text="启用 AI", variable=ai_enabled).pack(anchor='w', padx=12)
+        self.api_key_edit = LineEdit()
+        self.api_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.api_key_edit.setText(cfg.get('ai', {}).get('api_key', ''))
+        self.api_key_edit.setPlaceholderText("输入 API Key")
+        ai_cards.addWidget(self._make_edit_card("API Key", self.api_key_edit))
 
-        ctk.CTkLabel(scroll, text="API 端点", font=ctk.CTkFont(size=12)).pack(anchor='w', padx=12, pady=(8, 0))
-        base_url = ctk.CTkEntry(scroll, height=32)
-        base_url.pack(fill='x', padx=12)
-        base_url.insert(0, cfg.get('ai', {}).get('base_url', ''))
+        self.model_edit = LineEdit()
+        self.model_edit.setText(cfg.get('ai', {}).get('model', 'gpt-4o-mini'))
+        ai_cards.addWidget(self._make_edit_card("模型", self.model_edit))
+        container_layout.addWidget(ai_group)
 
-        ctk.CTkLabel(scroll, text="API Key", font=ctk.CTkFont(size=12)).pack(anchor='w', padx=12, pady=(8, 0))
-        api_key = ctk.CTkEntry(scroll, height=32, show='•')
-        api_key.pack(fill='x', padx=12)
-        api_key.insert(0, cfg.get('ai', {}).get('api_key', ''))
+        # ===== Everything 设置 =====
+        ev_group, ev_cards = self._make_group("🔍 Everything 设置")
+        self.dll_path_edit = LineEdit()
+        self.dll_path_edit.setText(cfg.get('everything', {}).get('dll_path', ''))
+        self.dll_path_edit.setPlaceholderText("留空自动检测")
+        ev_cards.addWidget(self._make_edit_card("DLL 路径", self.dll_path_edit))
+        container_layout.addWidget(ev_group)
 
-        ctk.CTkLabel(scroll, text="模型", font=ctk.CTkFont(size=12)).pack(anchor='w', padx=12, pady=(8, 0))
-        model = ctk.CTkEntry(scroll, height=32)
-        model.pack(fill='x', padx=12)
-        model.insert(0, cfg.get('ai', {}).get('model', 'gpt-4o-mini'))
+        # ===== 界面设置 =====
+        ui_group, ui_cards = self._make_group("🖥 界面设置")
+        self.max_results_edit = LineEdit()
+        self.max_results_edit.setText(str(cfg.get('ui', {}).get('max_results', 100)))
+        ui_cards.addWidget(self._make_edit_card("最大结果数", self.max_results_edit))
+        container_layout.addWidget(ui_group)
 
-        # Everything 设置
-        ctk.CTkLabel(scroll, text="🔍 Everything 设置", font=ctk.CTkFont(size=14, weight='bold')).pack(anchor='w', pady=(16, 4))
-        ctk.CTkLabel(scroll, text="DLL 路径（留空自动检测）", font=ctk.CTkFont(size=12)).pack(anchor='w', padx=12)
-        dll_path = ctk.CTkEntry(scroll, height=32)
-        dll_path.pack(fill='x', padx=12)
-        dll_path.insert(0, cfg.get('everything', {}).get('dll_path', ''))
+        # ===== 搜索过滤 =====
+        sf_cfg = cfg.get('search_filters', config.DEFAULT_CONFIG.get('search_filters', {}))
+        filter_group, filter_cards = self._make_group("🔽 搜索过滤")
+        self._filter_enabled_card, self._filter_enabled_switch = self._make_switch_card(
+            FluentIcon.FILTER, "启用过滤器", "", sf_cfg.get('enabled', True))
+        filter_cards.addWidget(self._filter_enabled_card)
 
-        # 界面设置
-        ctk.CTkLabel(scroll, text="🖥 界面设置", font=ctk.CTkFont(size=14, weight='bold')).pack(anchor='w', pady=(16, 4))
-        ctk.CTkLabel(scroll, text="最大结果数", font=ctk.CTkFont(size=12)).pack(anchor='w', padx=12)
-        max_results = ctk.CTkEntry(scroll, height=32)
-        max_results.pack(fill='x', padx=12)
-        max_results.insert(0, str(cfg.get('ui', {}).get('max_results', 100)))
-
-        # 搜索过滤
-        ctk.CTkLabel(scroll, text="🔽 搜索过滤", font=ctk.CTkFont(size=14, weight='bold')).pack(anchor='w', pady=(16, 4))
-
-        filter_enabled = ctk.BooleanVar(value=cfg.get('search_filters', {}).get('enabled', True))
-        ctk.CTkCheckBox(scroll, text="启用过滤器", variable=filter_enabled).pack(anchor='w', padx=12)
-
-        ctk.CTkLabel(scroll, text="排除文件夹（每行一个）", font=ctk.CTkFont(size=12)).pack(anchor='w', padx=12, pady=(8, 0))
+        self.exclude_edit = TextEdit()
         _default_exclude = config.DEFAULT_CONFIG.get('search_filters', {}).get('exclude_folders', [])
-        _user_exclude = cfg.get('search_filters', {}).get('exclude_folders', [])
-        exclude_text = '\n'.join(_user_exclude if _user_exclude else _default_exclude)
-        exclude_folders = ctk.CTkTextbox(scroll, height=100)
-        exclude_folders.pack(fill='x', padx=12)
-        exclude_folders.insert('1.0', exclude_text)
+        _user_exclude = sf_cfg.get('exclude_folders', [])
+        self.exclude_edit.setPlainText('\n'.join(_user_exclude if _user_exclude else _default_exclude))
+        self.exclude_edit.setFixedHeight(80)
+        exc_card = SimpleCardWidget()
+        exc_layout = QVBoxLayout(exc_card)
+        exc_layout.setContentsMargins(12, 6, 12, 6)
+        exc_layout.addWidget(BodyLabel("排除文件夹（每行一个）"))
+        exc_layout.addWidget(self.exclude_edit)
+        filter_cards.addWidget(exc_card)
+        container_layout.addWidget(filter_group)
 
-        # 内容搜索设置
-        ctk.CTkLabel(scroll, text="📄 内容搜索设置", font=ctk.CTkFont(size=14, weight='bold')).pack(anchor='w', pady=(16, 4))
+        # ===== 内容搜索设置 =====
+        cr_cfg = cfg.get('content_reader', config.DEFAULT_CONFIG.get('content_reader', {}))
+        cr_group, cr_cards = self._make_group("📄 内容搜索设置")
 
-        _cr_cfg = cfg.get('content_reader', config.DEFAULT_CONFIG.get('content_reader', {}))
-        cr_enabled = ctk.BooleanVar(value=self._content_reader_enabled.get())
-        ctk.CTkCheckBox(scroll, text="启用文档内容搜索", variable=cr_enabled).pack(anchor='w', padx=12)
+        win = self._window
+        cr_enabled = win.searchInterface._content_reader_enabled if win else cr_cfg.get('enabled', False)
+        self._cr_enabled_card, self._cr_enabled_switch = self._make_switch_card(
+            FluentIcon.DOCUMENT, "启用文档内容搜索", "", cr_enabled)
+        cr_cards.addWidget(self._cr_enabled_card)
 
-        ai_summary = ctk.BooleanVar(value=self._ai_summary_enabled.get())
-        ctk.CTkCheckBox(scroll, text="启用 AI 内容总结（需要 AI 已启用）", variable=ai_summary).pack(anchor='w', padx=12)
+        ai_summary = win.searchInterface._ai_summary_enabled if win else cr_cfg.get('ai_summary_enabled', False)
+        self._ai_summary_card, self._ai_summary_switch = self._make_switch_card(
+            FluentIcon.ROBOT, "启用 AI 内容总结", "需要 AI 已启用", ai_summary)
+        cr_cards.addWidget(self._ai_summary_card)
 
-        ctk.CTkLabel(scroll, text="每个文件最大读取字符数", font=ctk.CTkFont(size=12)).pack(anchor='w', padx=12, pady=(8, 0))
-        max_chars_entry = ctk.CTkEntry(scroll, height=32)
-        max_chars_entry.pack(fill='x', padx=12)
-        max_chars_entry.insert(0, str(_cr_cfg.get('max_chars_per_file', 5000)))
+        self.max_chars_edit = LineEdit()
+        self.max_chars_edit.setText(str(cr_cfg.get('max_chars_per_file', 5000)))
+        cr_cards.addWidget(self._make_edit_card("每个文件最大读取字符数", self.max_chars_edit))
+        container_layout.addWidget(cr_group)
 
-        # 保存按钮
-        def _save():
-            new_cfg = {
-                'ai': {
-                    'enabled': ai_enabled.get(),
-                    'base_url': base_url.get().strip(),
-                    'api_key': api_key.get().strip(),
-                    'model': model.get().strip() or 'gpt-4o-mini',
-                    'max_tokens': 1500, 'temperature': 0.2
-                },
-                'everything': {'dll_path': dll_path.get().strip()},
-                'ui': {'max_results': int(max_results.get()) or 100, 'theme': ctk.get_appearance_mode()},
-                'search_filters': {
-                    'enabled': filter_enabled.get(),
-                    'exclude_folders': [l.strip() for l in exclude_folders.get('1.0').strip().split('\n') if l.strip()],
-                    'exclude_paths': [],
-                    'folder_sort_order': cfg.get('search_filters', {}).get('folder_sort_order', 'first')
-                },
-                'content_reader': {
-                    'enabled': cr_enabled.get(),
-                    'max_chars_per_file': int(max_chars_entry.get()) or 5000,
-                    'supported_formats': _cr_cfg.get('supported_formats', [
-                        '.pdf', '.docx', '.doc', '.xlsx', '.xls',
-                        '.pptx', '.ppt', '.txt', '.md', '.rtf',
-                        '.epub', '.html', '.htm', '.odt', '.ods', '.odp'
-                    ]),
-                    'ai_summary_enabled': ai_summary.get()
-                }
+        # ===== 日志窗口 =====
+        log_group, log_cards = self._make_group("📋 运行日志")
+        self.log_text = TextEdit()
+        self.log_text.setReadOnly(True)
+        self.log_text.setFixedHeight(120)
+        self.log_text.setStyleSheet("QTextEdit { font-family: 'Consolas', monospace; font-size: 10px; }")
+
+        log_card = SimpleCardWidget()
+        log_layout = QVBoxLayout(log_card)
+        log_layout.setContentsMargins(12, 6, 12, 6)
+        log_layout.addWidget(BodyLabel("运行日志"))
+        log_layout.addWidget(self.log_text)
+        log_cards.addWidget(log_card)
+        container_layout.addWidget(log_group)
+
+        container_layout.addStretch()
+        scroll.setWidget(container)
+        layout.addWidget(scroll, 1)
+
+        # ===== 保存按钮 =====
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        save_btn = PrimaryPushButton("💾 保存")
+        save_btn.clicked.connect(self._save_settings)
+        btn_layout.addWidget(save_btn)
+        layout.addLayout(btn_layout)
+
+        # 启动日志刷新
+        self._log_timer = QTimer(self)
+        self._log_timer.timeout.connect(self._refresh_log)
+        self._log_timer.start(1000)
+
+    def _make_edit_card(self, title, edit):
+        card = SimpleCardWidget()
+        card_layout = QVBoxLayout(card)
+        card_layout.setSpacing(2)
+        card_layout.addWidget(BodyLabel(title))
+        card_layout.addWidget(edit)
+        return card
+
+    def _make_switch_card(self, icon, title, content, checked):
+        card = SimpleCardWidget()
+        card_layout = QHBoxLayout(card)
+        card_layout.setContentsMargins(16, 8, 16, 8)
+        left = QVBoxLayout()
+        left.setSpacing(2)
+        left.addWidget(BodyLabel(title))
+        if content:
+            left.addWidget(CaptionLabel(content))
+        card_layout.addLayout(left, 1)
+        switch = SwitchButton()
+        switch.setChecked(checked)
+        card_layout.addWidget(switch)
+        card_layout.addStretch()
+        return card, switch
+
+    def _refresh_log(self):
+        capture = LogCapture()
+        new_text = capture.get_text(tail=200)
+        if new_text:
+            self.log_text.setPlainText(new_text)
+
+    def _save_settings(self):
+        win = self._window
+        new_cfg = {
+            'ai': {
+                'enabled': self._ai_enabled_switch.isChecked(),
+                'base_url': self.base_url_edit.text().strip(),
+                'api_key': self.api_key_edit.text().strip(),
+                'model': self.model_edit.text().strip() or 'gpt-4o-mini',
+                'max_tokens': 1500, 'temperature': 0.2
+            },
+            'everything': {'dll_path': self.dll_path_edit.text().strip()},
+            'ui': {
+                'max_results': int(self.max_results_edit.text()) if self.max_results_edit.text().isdigit() else 100,
+                'theme': 'Dark' if isDarkTheme() else 'Light'
+            },
+            'search_filters': {
+                'enabled': self._filter_enabled_switch.isChecked(),
+                'exclude_folders': [l.strip() for l in self.exclude_edit.toPlainText().strip().split('\n') if l.strip()],
+                'exclude_paths': [],
+                'folder_sort_order': 'first'
+            },
+            'content_reader': {
+                'enabled': self._cr_enabled_switch.isChecked(),
+                'max_chars_per_file': int(self.max_chars_edit.text()) if self.max_chars_edit.text().isdigit() else 5000,
+                'supported_formats': [
+                    '.pdf', '.docx', '.doc', '.xlsx', '.xls',
+                    '.pptx', '.ppt', '.txt', '.md', '.rtf',
+                    '.epub', '.html', '.htm', '.odt', '.ods', '.odp'
+                ],
+                'ai_summary_enabled': self._ai_summary_switch.isChecked()
             }
-            config.save_config(new_cfg)
-            # 更新当前状态
-            self._content_reader_enabled.set(cr_enabled.get())
-            self._ai_summary_enabled.set(ai_summary.get())
-            # 同步 ContentReader 的 enabled 状态
-            if self.content_reader:
-                self.content_reader.enabled = cr_enabled.get()
-            # 更新按钮样式
-            self._update_content_toggle_buttons()
-            # 重新初始化 Agent（传入 content_reader）
+        }
+        config.save_config(new_cfg)
+
+        # 更新搜索界面状态
+        if win:
+            cr_enabled = self._cr_enabled_switch.isChecked()
+            ai_summary = self._ai_summary_switch.isChecked()
+            win.searchInterface._content_reader_enabled = cr_enabled
+            win.searchInterface._ai_summary_enabled = ai_summary
+            win.searchInterface.update_content_toggle_buttons()
+
+            if win.content_reader:
+                win.content_reader.enabled = cr_enabled
+
+            # 重新初始化 Agent
             from ai_parser import SearchAgent
-            self.agent = SearchAgent(self.search_engine, self.tag_manager, self.content_reader)
-            self._search_filters = new_cfg['search_filters']
-            self.toast.show("配置已保存", 'success')
-            dialog.destroy()
+            win.agent = SearchAgent(win.search_engine, win.tag_manager, win.content_reader)
 
-        btn_frame = ctk.CTkFrame(dialog, fg_color='transparent')
-        btn_frame.pack(fill='x', padx=16, pady=12)
-        ctk.CTkButton(btn_frame, text="保存", command=_save).pack(side='right', padx=4)
-        ctk.CTkButton(btn_frame, text="取消", fg_color='transparent', hover_color=_tc()['bg_hover'],
-                       text_color=_tc()['text_sec'], command=dialog.destroy).pack(side='right')
+            win._search_filters = new_cfg['search_filters']
 
-    def _show_create_tag(self):
-        dialog = ctk.CTkInputDialog(text="输入新标签名称：", title="新建标签")
-        name = dialog.get_input()
-        if name and name.strip():
-            def _do():
-                try:
-                    self.agent.process(name.strip(), {"selected_files": ["__create_tag__"]})
-                    self.after(0, lambda: (self.toast.show(f"标签 \"{name.strip()}\" 已创建", 'success'),
-                                            self._refresh_tags_sidebar()))
-                except Exception as e:
-                    self.after(0, lambda: self.toast.show(f"创建出错: {e}", 'error'))
-            threading.Thread(target=_do, daemon=True).start()
+        InfoBar.success(title="成功", content="配置已保存", parent=self)
 
-    def _show_rename_tag(self, old_name):
-        dialog = ctk.CTkInputDialog(text=f"重命名标签 \"{old_name}\" 为：", title="重命名标签")
-        new_name = dialog.get_input()
-        if new_name and new_name.strip() and new_name.strip() != old_name:
-            def _do():
-                try:
-                    result = self.tag_manager.rename_tag(old_name, new_name.strip())
-                    self.after(0, lambda: self.toast.show(result.get('message', '已重命名'),
-                                 'success' if result.get('success') else 'error'))
-                    self.after(0, self._refresh_tags_sidebar)
-                except Exception as e:
-                    self.after(0, lambda: self.toast.show(f"重命名出错: {e}", 'error'))
-            threading.Thread(target=_do, daemon=True).start()
 
-    # ============ 状态检查 ============
+# ============ 主窗口 ============
+class FaindWindow(FluentWindow):
+    """Faind 主窗口 — FluentUI 风格"""
+
+    def __init__(self):
+        # 主题设置（在创建UI前）
+        _cfg = config.load_config()
+        _theme = _cfg.get('ui', {}).get('theme', 'Dark')
+        setTheme(Theme.DARK if _theme == 'Dark' else Theme.LIGHT)
+
+        # 创建子界面
+        self.searchInterface = SearchInterface()
+        self.tagsInterface = TagsInterface()
+        self.settingsInterface = SettingsInterface()
+
+        super().__init__()
+
+        # 注册子界面到导航 (必须在 super().__init__() 之后，因为需要 navigationInterface 已创建)
+        self.initNavigation()
+
+        # 相互引用
+        self.searchInterface.set_window(self)
+        self.tagsInterface.set_window(self)
+        self.settingsInterface.set_window(self)
+
+        # 状态 (必须在 _setup_window 前初始化，因为 _update_sort_buttons 依赖 _search_filters)
+        self._search_history = []
+        self._selected_files = set()
+        _sf = _cfg.get('search_filters', {})
+        _default_sf = config.DEFAULT_CONFIG.get('search_filters', {})
+        if not _sf.get('exclude_folders'):
+            _sf['exclude_folders'] = _default_sf.get('exclude_folders', [])
+        self._search_filters = _sf
+
+        # 模块引用
+        self.search_engine = None
+        self.agent = None
+        self.tag_manager = None
+        self.content_reader = None
+        self._not_relevant_cache = None
+
+        self._setup_window()
+
+    def _setup_window(self):
+        self.setWindowTitle("Faind - 智能文件定位与标签系统")
+        self.resize(1200, 800)
+        self.setMinimumSize(900, 600)
+
+        self.navigationInterface.setExpandWidth(200)
+        self.navigationInterface.setMinimumExpandWidth(200)
+
+        self.searchInterface._update_sort_buttons()
+        self.searchInterface._update_search_filter_btn()
+
+    def initNavigation(self):
+        self.addSubInterface(self.searchInterface, FluentIcon.SEARCH, '搜索')
+        self.addSubInterface(self.tagsInterface, FluentIcon.TAG, '标签管理')
+        self.navigationInterface.addSeparator()
+        self.addSubInterface(self.settingsInterface, FluentIcon.SETTING, '设置',
+                            NavigationItemPosition.BOTTOM)
+
+    def set_modules(self, search_engine, agent, tag_manager, content_reader=None):
+        self.search_engine = search_engine
+        self.agent = agent
+        self.tag_manager = tag_manager
+        self.content_reader = content_reader
+        self._not_relevant_cache = NotRelevantCache()
+
+    def start_indexing(self):
+        if not self.search_engine or not self.search_engine._initialized:
+            return
+
+        self.worker = IndexWaitWorker(self.search_engine, timeout=180)
+        self.worker.finished.connect(self._on_index_ready)
+        self.worker.start()
+
+    def _on_index_ready(self, ok):
+        if ok:
+            print("[Faind] Everything 索引就绪")
+        else:
+            print("[Faind] 警告: 索引建立超时，搜索结果可能不完整")
+        self.check_status()
+
     def check_status(self):
         if not self.search_engine:
-            self._status_label.configure(text_color='#e74c3c')
             return
         detail = self.search_engine.get_status_detail()
-        if detail['everything_running']:
-            self._status_label.configure(text_color='#27ae60')
-        elif detail['cli_available'] or detail['dll_loaded']:
-            self._status_label.configure(text_color='#f39c12')
-        else:
-            self._status_label.configure(text_color='#e74c3c')
+
+    def _save_search_filters(self):
+        cfg = config.load_config()
+        cfg['search_filters'] = self._search_filters
+        config.save_config(cfg)
+
+    def closeEvent(self, event):
+        logger.info("正在关闭 Faind...")
+        if self.search_engine:
+            self.search_engine.shutdown()
+        super().closeEvent(event)
+
+
+# ============ 向后兼容 ============
+FaindApp = FaindWindow

@@ -40,9 +40,12 @@ a = Analysis(
         (str(ROOT / 'library' / 'Everything-SDK' / 'dll' / 'Everything64.dll'), 'library/Everything-SDK/dll'),
         # ES CLI（DLL降级备用）
         (str(ROOT / 'library' / 'ES-1.1.0.30.x64'), 'library/ES-1.1.0.30.x64'),
+        # 内嵌 Everything 便携版（确保后台无安装也能搜索）
+        (str(ROOT / 'library' / 'Everything'), 'library/Everything'),
     ] + CERTIFI_DATAS,
     hiddenimports=[
-        'customtkinter',
+        'PySide6',
+        'qfluentwidgets',
         'openai',
         'requests',
         'dotenv',
@@ -70,8 +73,8 @@ a = Analysis(
         'numpy', 'pandas', 'scipy', 'matplotlib', 'numba', 'llvmlite',
         # 深度学习（Faind不需要）
         'torch', 'tensorflow', 'keras', 'onnx',
-        # Qt（customtkinter用tkinter，不需要Qt）
-        'PyQt5', 'PyQt6', 'PySide2', 'PySide6', 'qtpy',
+        # 其他 Qt 绑定（仅需 PySide6）
+        'PyQt5', 'PyQt6', 'PySide2', 'qtpy',
         # 图像处理（Faind不需要）
         'PIL', 'Pillow', 'opencv', 'cv2',
         # Web/爬虫（Faind不需要）

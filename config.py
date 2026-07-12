@@ -365,6 +365,84 @@ def resolve_dll_path() -> str:
     
     return ""
 
+def get_everything_dir() -> Path:
+    """
+    获取内嵌 Everything 的持久化目录（exe 旁的 library/Everything/）
+    """
+    return get_exe_dir() / "library" / "Everything"
+
+
+def resolve_everything_exe_path() -> str:
+    """
+    解析内嵌的 Everything64.exe 路径
+    优先持久化位置，其次应用目录（开发模式/MEIPASS）
+    """
+    persistent = get_everything_dir() / "Everything64.exe"
+    if persistent.exists():
+        return str(persistent)
+
+    app_dir = get_app_dir()
+    candidates = [
+        app_dir / "library" / "Everything" / "Everything64.exe",
+        app_dir / "Everything64.exe",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+
+    # 常见安装路径（用户可能已安装）
+    for p in [
+        r"C:\Program Files\Everything\Everything64.exe",
+        r"C:\Program Files (x86)\Everything\Everything64.exe",
+    ]:
+        if os.path.isfile(p):
+            return p
+
+    return ""
+
+
+def _ensure_everything_extracted() -> Path:
+    """
+    首次运行时将内嵌的 Everything 便携版复制到持久化目录
+    返回持久化目录路径
+    """
+    import shutil
+    target_dir = get_everything_dir()
+    target_exe = target_dir / "Everything64.exe"
+
+    if target_exe.exists():
+        return target_dir
+
+    if not getattr(sys, 'frozen', False):
+        # 开发模式：直接使用 library/Everything/，无需复制
+        source_dir = Path(__file__).parent / "library" / "Everything"
+        if (source_dir / "Everything64.exe").exists():
+            print(f"[Config] 开发模式，Everything 位于: {source_dir}")
+            return source_dir
+        return target_dir
+
+    # 打包模式：从 MEIPASS 复制到持久化目录
+    meipass = getattr(sys, '_MEIPASS', None)
+    if meipass:
+        source_dir = Path(meipass) / "library" / "Everything"
+        if source_dir.exists() and (source_dir / "Everything64.exe").exists():
+            target_dir.mkdir(parents=True, exist_ok=True)
+            for item in source_dir.iterdir():
+                dst = target_dir / item.name
+                if not dst.exists():
+                    try:
+                        if item.is_dir():
+                            shutil.copytree(item, dst)
+                        else:
+                            shutil.copy2(item, dst)
+                    except OSError as e:
+                        print(f"[Config] 复制 Everything 文件失败: {item.name}: {e}")
+            print(f"[Config] Everything 已解压到: {target_dir}")
+            return target_dir
+
+    return target_dir
+
+
 def resolve_es_cli_path() -> str:
     """
     解析 ES CLI 路径

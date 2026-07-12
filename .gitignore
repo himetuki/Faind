@@ -24,3 +24,7 @@ tags.db
 
 # 用户配置（含 API Key，请复制 config.example.json 为 config.json 后填写）
 config.json
+
+# 旧文件归档（测试脚本、开发文档、日志）
+old/
+*.log

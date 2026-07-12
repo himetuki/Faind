@@ -1,6 +1,6 @@
 """
 Faind 主入口
-启动 customtkinter 原生桌面界面
+启动 PySide6 + qfluentwidgets FluentUI 桌面界面
 """
 
 import sys
@@ -8,14 +8,12 @@ import os
 import logging
 from pathlib import Path
 
-# 配置日志 — 同时输出到终端和文件
-logging.basicConfig(
-    level=logging.INFO,
-    format='[%(name)s] %(levelname)s: %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-    ]
-)
+# 配置日志 — 先设级别，LogCapture 接管后统一输出到控制台 + 缓冲区
+logging.root.setLevel(logging.INFO)
+
+# 提前导入 LogCapture 并在 basicConfig 之前挂载，捕获所有后续输出
+from gui import LogCapture
+LogCapture().hook()
 
 import config
 from ai_parser import SearchAgent
@@ -64,21 +62,47 @@ def main():
     tag_manager = TagManager()
     content_reader = ContentReader()
     agent = SearchAgent(search_engine, tag_manager, content_reader)
+
+    # 自动确保 Everything 在后台运行（如未运行则启动内嵌便携版）
+    print("[Faind] 检查 Everything 运行状态...")
+    everything_auto_started = search_engine.ensure_everything_running()
+    if everything_auto_started:
+        status = search_engine.get_status_detail()
+        if status.get("started_by_us"):
+            print("[Faind] 使用内嵌 Everything（软件自带）")
+        else:
+            print("[Faind] 使用系统已安装的 Everything")
+    else:
+        print("[Faind] 警告: 无法启动 Everything，搜索功能可能不可用")
+        print("[Faind] 请从 https://www.voidtools.com/ 下载 Everything Portable Zip x64")
+        print("[Faind] 将 Everything64.exe 放入 library/Everything/ 目录")
+
     print("[Faind] 模块初始化完成")
 
-    # 启动 GUI
-    import customtkinter as ctk
+    # 启动 GUI（PySide6 + qfluentwidgets FluentUI）
+    from PySide6.QtWidgets import QApplication
+    from PySide6.QtCore import Qt
     from gui import FaindApp
 
-    ctk.set_appearance_mode("light")
-    ctk.set_default_color_theme("blue")
+    # 启用高 DPI 缩放
+    QApplication.setHighDpiScaleFactorRoundingPolicy(
+        Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+    )
+    qt_app = QApplication(sys.argv)
+    qt_app.setAttribute(Qt.ApplicationAttribute.AA_DontCreateNativeWidgetSiblings)
 
-    app = FaindApp()
-    app.set_modules(search_engine, agent, tag_manager, content_reader)
-    app.check_status()
+    # FaindWindow 内部会根据配置自动设置 light/dark 主题
+    window = FaindApp()
+    window.set_modules(search_engine, agent, tag_manager, content_reader)
+    window.check_status()
+
+    # 后台建立索引（不阻塞界面）
+    if everything_auto_started:
+        window.start_indexing()
 
     print("[Faind] 正在启动界面...")
-    app.mainloop()
+    window.show()
+    sys.exit(qt_app.exec())
 
 
 if __name__ == "__main__":
