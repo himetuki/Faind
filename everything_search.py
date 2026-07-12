@@ -94,6 +94,9 @@ class EverythingSearch:
         self._initialized = False
         self._use_cli = False
         self._es_cli_path = ""
+        self._started_by_us = False      # 是否由 Faind 启动 Everything
+        self._everything_process = None  # 子进程句柄
+        self._index_ready = False        # 索引是否就绪
         
         # 始终探测 CLI 路径，作为运行时降级备用
         cli_path = config.resolve_es_cli_path()
@@ -206,6 +209,10 @@ class EverythingSearch:
         # 重置
         dll.Everything_Reset.argtypes = []
         dll.Everything_Reset.restype = None
+
+        # 索引状态
+        dll.Everything_IsDBLoaded.argtypes = []
+        dll.Everything_IsDBLoaded.restype = wintypes.BOOL
 
     @property
     def is_available(self) -> bool:
@@ -599,6 +606,226 @@ class EverythingSearch:
             size /= 1024
         return f"{size:.1f} PB"
 
+    def ensure_everything_running(self) -> bool:
+        """
+        确保 Everything 服务在运行。
+        优先使用用户已安装并运行的 Everything；
+        如果未运行，自动启动内嵌的 Everything64.exe 便携版。
+        :return: Everything 是否可用的
+        """
+        # 1. 检查是否已在运行（用户已安装的 Everything）
+        if self.check_everything_running():
+            print("[EverythingSearch] 检测到 Everything 已在运行，使用现有服务")
+            self._started_by_us = False
+            return True
+
+        # 2. 未运行，启动内嵌便携版
+        print("[EverythingSearch] Everything 未运行，尝试启动内嵌版本...")
+        return self._start_embedded_everything()
+
+    def _start_embedded_everything(self) -> bool:
+        """启动内嵌的 Everything64.exe 便携版（后台模式）"""
+        import time
+
+        everything_dir = config._ensure_everything_extracted()
+        everything_exe = everything_dir / "Everything64.exe"
+
+        if not everything_exe.exists():
+            print(f"[EverythingSearch] 内嵌 Everything 不存在: {everything_exe}")
+            return False
+
+        try:
+            ini_path = everything_dir / "Everything.ini"
+            cmd = [str(everything_exe)]
+            if ini_path.exists():
+                cmd += ["-config", str(ini_path)]
+            cmd.append("-startup")
+
+            print(f"[EverythingSearch] 启动内嵌 Everything: {' '.join(cmd)}")
+
+            # 创建进程，隐藏窗口
+            creationflags = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0x08000000
+            self._everything_process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=creationflags,
+            )
+
+            # 等待 Everything 初始化（最多 10 秒）
+            for _ in range(20):
+                time.sleep(0.5)
+                if self.check_everything_running():
+                    self._started_by_us = True
+                    print(f"[EverythingSearch] 内嵌 Everything 已就绪 ({everything_exe})")
+
+                    # 如果还没初始化搜索模式，尝试匹配模式
+                    if not self._initialized:
+                        self._try_auto_init()
+
+                    return True
+
+            print("[EverythingSearch] 内嵌 Everything 启动超时（10秒）")
+            return False
+
+        except FileNotFoundError:
+            print(f"[EverythingSearch] 无法启动 Everything: 文件不存在 {everything_exe}")
+            return False
+        except Exception as e:
+            print(f"[EverythingSearch] 启动 Everything 失败: {e}")
+            return False
+
+    def _try_auto_init(self):
+        """自动初始化搜索模式（在确保 Everything 运行后）"""
+        if self._initialized:
+            return
+
+        # 优先尝试 DLL
+        resolved_dll = config.resolve_dll_path()
+        if resolved_dll and os.path.isfile(resolved_dll):
+            try:
+                self._load_dll(resolved_dll)
+                if self._initialized:
+                    return
+            except Exception:
+                pass
+
+        # 降级到 CLI
+        self._try_fallback_to_cli()
+
+    def is_index_ready(self) -> bool:
+        """
+        检查 Everything 索引是否已就绪（数据库加载完毕）。
+        DLL 模式通过 Everything_IsDBLoaded 判断，
+        CLI 模式通过尝试搜索 '*' 并检查是否有结果来判断。
+        """
+        if not self._initialized:
+            return False
+
+        if self._use_cli:
+            return self._check_index_ready_cli()
+        else:
+            return self._check_index_ready_dll()
+
+    def _check_index_ready_dll(self) -> bool:
+        """通过 SDK DLL 检查 IsDBLoaded"""
+        if not self.dll:
+            return False
+        try:
+            return bool(self.dll.Everything_IsDBLoaded())
+        except Exception:
+            return False
+
+    def _check_index_ready_cli(self) -> bool:
+        """通过 ES CLI 检查索引（搜索 '*' 看返回码）"""
+        if not self._es_cli_path:
+            return False
+        try:
+            result = subprocess.run(
+                [self._es_cli_path, "-n", "1"],
+                capture_output=True, text=True, timeout=5,
+                encoding="utf-8", errors="replace",
+            )
+            # IPC 错误 = Everything 未运行，返回空 = 索引未就绪
+            if result.returncode != 0 and "IPC" in (result.stderr or ""):
+                return False
+            # 返回 0 或返回结果 → 索引就绪
+            return result.returncode == 0
+        except Exception:
+            return False
+
+    def wait_for_index(self, timeout: float = 60, progress_callback=None) -> bool:
+        """
+        等待 Everything 索引就绪。
+        :param timeout: 超时秒数（首次启动 MFT 扫描可能较慢，建议 60-120）
+        :param progress_callback: 可选回调 callback(elapsed_seconds, total_indexed)
+        :return: 索引是否在超时内就绪
+        """
+        import time
+        if not self._initialized:
+            return False
+
+        # 先快速检查
+        if self.is_index_ready():
+            self._index_ready = True
+            if progress_callback:
+                total = self._get_total_indexed()
+                progress_callback(0, total)
+            return True
+
+        start = time.monotonic()
+        last_total = 0
+
+        # 轮询等待
+        while time.monotonic() - start < timeout:
+            time.sleep(0.5)
+
+            if self.is_index_ready():
+                self._index_ready = True
+                if progress_callback:
+                    total = self._get_total_indexed()
+                    progress_callback(time.monotonic() - start, total)
+                return True
+
+            # 上报正在构建中的进度
+            if progress_callback:
+                total = self._get_total_indexed()
+                if total != last_total:
+                    last_total = total
+                    progress_callback(time.monotonic() - start, total)
+
+        self._index_ready = False
+        return False
+
+    def _get_total_indexed(self) -> int:
+        """获取当前已索引的文件+文件夹总数（可能不精确）"""
+        if self._use_cli:
+            return self._get_total_indexed_cli()
+        return self._get_total_indexed_dll()
+
+    def _get_total_indexed_dll(self) -> int:
+        """通过 SDK 获取已索引数"""
+        if not self.dll or not self._check_index_ready_dll():
+            return 0
+        try:
+            # IsDBLoaded 返回 true 后，运行一次空查询来获取统计
+            self.dll.Everything_Reset()
+            self.dll.Everything_SetSearchW("")
+            self.dll.Everything_SetMax(1)
+            if self.dll.Everything_QueryW(True):
+                return self.dll.Everything_GetTotResults()
+        except Exception:
+            pass
+        return 0
+
+    def _get_total_indexed_cli(self) -> int:
+        """通过 CLI 获取已索引数"""
+        try:
+            result = subprocess.run(
+                [self._es_cli_path, "-get-total-size"],
+                capture_output=True, text=True, timeout=5,
+                encoding="utf-8", errors="replace",
+            )
+            if result.returncode == 0:
+                return int(result.stdout.strip())
+        except Exception:
+            pass
+        return 0
+
+    def shutdown(self):
+        """关闭由 Faind 启动的 Everything 进程"""
+        if self._started_by_us and self._everything_process:
+            try:
+                print("[EverythingSearch] 正在关闭内嵌 Everything...")
+                self._everything_process.terminate()
+                self._everything_process.wait(timeout=5)
+                print("[EverythingSearch] 内嵌 Everything 已关闭")
+            except Exception as e:
+                print(f"[EverythingSearch] 关闭 Everything 时出错: {e}")
+            finally:
+                self._started_by_us = False
+                self._everything_process = None
+
     def check_everything_running(self) -> bool:
         """检查 Everything 是否正在运行"""
         if self._use_cli:
@@ -634,11 +861,14 @@ class EverythingSearch:
         dll_loaded = self.dll is not None
         everything_running = False
         cli_available = bool(self._es_cli_path) and os.path.isfile(self._es_cli_path) if self._es_cli_path else False
+        index_ready = self._index_ready
 
         if dll_loaded and not self._use_cli:
             everything_running = self.check_everything_running()
+            index_ready = self.is_index_ready()
         elif self._use_cli:
             everything_running = self.check_everything_running()
+            index_ready = self.is_index_ready()
 
         return {
             "dll_loaded": dll_loaded,
@@ -647,4 +877,8 @@ class EverythingSearch:
             "use_cli": self._use_cli,
             "everything_running": everything_running,
             "search_available": self._initialized,
+            "index_ready": index_ready,
+            "started_by_us": self._started_by_us,
+            "using_embedded": self._started_by_us,   # 是否使用内嵌 Everything
+            "using_user": everything_running and not self._started_by_us,  # 是否使用用户已安装的 Everything
         }
