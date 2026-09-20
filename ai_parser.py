@@ -86,6 +86,17 @@ AGENT_SYSTEM_PROMPT = """你是 Faind 文件搜索助手，一个智能文件管
 - 尝试不同的 Everything 语法表达（如 path:关键词 改用直接关键词，或反过来）
 - 最多尝试3轮不同的搜索策略，直到找到文件或确认确实不存在
 
+## 高级命令行工具（按需使用）
+当 search_files 的 Everything 语法无法满足需求时，才使用以下原生命令行工具。它们只读，不会修改任何文件：
+- run_fd_command：fd 原生命令。适用于正则表达式、布尔组合（OR/NOT）、路径级精确匹配（--full-path）、--changed-within/--size 区间等 search_files 表达不了的查询
+- run_everything_command：ES CLI 原生命令。适用于 Everything 特有函数（regex:、dupe:、content: 等），需 Everything 正在运行
+
+调用纪律：
+1. 先用 search_files 尝试，结果不理想或语法表达不了时再升级到命令工具
+2. 命令参数必须聚焦搜索条件，不要执行与查找文件无关的命令
+3. 命令工具的返回是原始文本（每行一个文件路径），在回复中直接引用路径，不要复述整段输出
+4. 若命令工具报错（参数不支持、引擎不可用等），回退到 search_files，不要反复重试同一命令
+
 ## 内容搜索流程（用户要求查找包含特定内容的文件时）
 当用户意图涉及文件**内容**（如"包含XXX的资料"、"关于XXX的文档"），必须遵循两阶段流程：
 
@@ -129,6 +140,48 @@ TOOLS = [
                     }
                 },
                 "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_fd_command",
+            "description": "直接执行 fd 原生命令行搜索，用于 search_files 无法表达的复杂查询（正则、布尔组合、--changed-within/--size 区间、--full-path 精确路径匹配等）。只读搜索，不会修改任何文件。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "args": {
+                        "type": "string",
+                        "description": "fd 的命令行参数（不含 fd.exe 本身），空格分隔。例如：'-e pdf --changed-within 7d' 或 '合同 -e docx --full-path E:'"
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "可选，限定搜索根目录（必须是已存在的目录），例如 'E:\\工作'。不传则全盘搜索"
+                    }
+                },
+                "required": ["args"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_everything_command",
+            "description": "直接执行 ES CLI (es.exe) 原生命令行搜索，使用 Everything 完整语法（含正则、函数如 regex:/dupe:、size 区间、content: 等高级特性）。需要 Everything 正在运行。只读搜索，不会修改任何文件。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "args": {
+                        "type": "string",
+                        "description": "es.exe 的命令行参数（不含 es.exe 本身），空格分隔。例如：'ext:pdf dm:thisweek' 或 'regex:^合同.*\\.docx$ -size >1mb'"
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "可选，限定搜索根目录（必须是已存在的目录）。不传则由 Everything 全局索引搜索"
+                    }
+                },
+                "required": ["args"]
             }
         }
     },
@@ -572,14 +625,14 @@ class SearchAgent:
                     final_result["success"] = True
                     new_results = tool_result.get("results", [])
                     if new_results:
-                        existing = {r.get("full_path", "") for r in final_result["results"]}
-                        for r in new_results:
-                            if r.get("full_path", "") not in existing:
-                                final_result["results"].append(r)
-                                existing.add(r.get("full_path", ""))
-                        final_result["total"] = len(final_result["results"])
+                        self._merge_results(final_result, new_results)
                     elif not final_result["results"]:
                         final_result["total"] = 0
+                elif func_name in ("run_fd_command", "run_everything_command") and tool_result.get("success"):
+                    final_result["success"] = True
+                    new_results = tool_result.get("results", [])
+                    if new_results:
+                        self._merge_results(final_result, new_results)
                 elif func_name == "search_by_tag" and tool_result.get("success"):
                     final_result["success"] = True
                     final_result["results"] = tool_result.get("results", [])
@@ -610,6 +663,8 @@ class SearchAgent:
                         parts.append(a["result_summary"])
                     elif a["tool"] == "remove_tags":
                         parts.append(a["result_summary"])
+                    elif a["tool"] in ("run_fd_command", "run_everything_command"):
+                        parts.append(a["result_summary"])
                 final_result["message"] = "；".join(parts) if parts else "操作完成"
             else:
                 final_result["message"] = "未执行任何操作"
@@ -622,12 +677,39 @@ class SearchAgent:
 
         return final_result
 
+    @staticmethod
+    def _merge_results(final_result: dict, new_results: list) -> None:
+        """把新搜索结果按 full_path 去重后合并进最终结果集"""
+        existing = {r.get("full_path", "") for r in final_result["results"]}
+        for r in new_results:
+            fp = r.get("full_path", "")
+            if fp and fp not in existing:
+                final_result["results"].append(r)
+                existing.add(fp)
+        final_result["total"] = len(final_result["results"])
+
     def _execute_tool(self, name: str, args: dict) -> dict:
         """执行工具调用"""
         if name == "search_files":
             if not self.search_engine:
                 return {"success": False, "error": "搜索引擎不可用", "results": [], "total": 0}
             return self.search_engine.search(args.get("query", ""), args.get("max_results", 100))
+
+        elif name == "run_fd_command":
+            if not self.search_engine:
+                return {"success": False, "error": "搜索引擎不可用", "output": "", "truncated": False}
+            runner = getattr(self.search_engine, "run_raw_command", None)
+            if runner is None:
+                return {"success": False, "error": "当前搜索引擎不支持原生命令行", "output": "", "truncated": False}
+            return runner("fd", args.get("args", ""), args.get("path", ""))
+
+        elif name == "run_everything_command":
+            if not self.search_engine:
+                return {"success": False, "error": "搜索引擎不可用", "output": "", "truncated": False}
+            runner = getattr(self.search_engine, "run_raw_command", None)
+            if runner is None:
+                return {"success": False, "error": "当前搜索引擎不支持原生命令行", "output": "", "truncated": False}
+            return runner("es", args.get("args", ""), args.get("path", ""))
 
         elif name == "add_tags":
             if not self.tag_manager:
@@ -705,6 +787,12 @@ class SearchAgent:
         elif func_name == "read_file_contents":
             total = result.get("found", 0)
             return f"读取了 {total} 个文件的内容"
+        elif func_name in ("run_fd_command", "run_everything_command"):
+            if not result.get("success"):
+                return f"命令执行失败: {result.get('error', '未知错误')}"
+            lines = len([l for l in (result.get("output") or "").splitlines() if l.strip()])
+            suffix = "（输出已截断）" if result.get("truncated") else ""
+            return f"命令行搜索返回 {lines} 行结果{suffix}"
         return str(result)
 
     # ============ 快速匹配（规则优先路径） ============

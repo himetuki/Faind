@@ -8,6 +8,7 @@ import ctypes
 from ctypes import wintypes
 import os
 import re
+import shlex
 import subprocess
 import json
 import threading
@@ -258,6 +259,16 @@ class EverythingSearch:
     def is_cli_mode(self) -> bool:
         """是否使用 CLI 模式"""
         return self._use_cli
+
+    @property
+    def fd_path(self) -> str:
+        """已解析的 fd.exe 路径（未找到时为空字符串）"""
+        return self._fd_path
+
+    @property
+    def es_cli_path(self) -> str:
+        """已解析的 ES CLI (es.exe) 路径（未找到时为空字符串）"""
+        return self._es_cli_path
 
     @property
     def is_transitional(self) -> bool:
@@ -962,6 +973,179 @@ class EverythingSearch:
                 "error": f"fd 搜索异常: {str(e)}",
                 "total": 0
             }
+
+    # ============ 原生命令行执行（供 AI Agent 高级搜索工具调用） ============
+
+    # fd 参数黑名单：一切会触发外部命令执行或改写系统的开关一律拒绝
+    _FD_BLOCKED_LONG = {"--exec", "--exec-batch", "--exec-batch-multi"}
+    _FD_BLOCKED_SHORT_PREFIX = ("-x", "-X")
+    # es.exe 参数黑名单：保存/覆盖 Everything 配置类开关
+    _ES_BLOCKED_LONG = {"--save", "--savedate", "--config", "--instance"}
+    _ES_BLOCKED_SHORT_PREFIX = ("-save", "-config", "-instance")
+
+    _RAW_CMD_TIMEOUT = 60          # 秒
+    _RAW_MAX_LINES = 200           # 输出行数上限
+    _RAW_MAX_CHARS = 65536         # 输出字符数上限
+
+    @classmethod
+    def _is_blocked_arg(cls, token: str, blocked_long: set, blocked_short_prefix: tuple) -> bool:
+        """判断单个参数是否命中黑名单（支持 --long=value 与短选项附着值两种写法）"""
+        lowered = token.lower()
+        head = lowered.split("=", 1)[0]
+        if head in blocked_long:
+            return True
+        return any(lowered.startswith(prefix) for prefix in blocked_short_prefix)
+
+    def run_raw_command(self, kind: str, args: str, path: str = "") -> dict:
+        """
+        以只读方式执行 fd / es 原生命令，供 AI Agent 的高级搜索工具调用。
+
+        安全边界（四道闸，缺一不可）：
+        1. 可执行文件只能是本模块已解析的 fd.exe / es.exe，调用方无法指定
+        2. argv 列表执行，绝不经过 shell，杜绝字符串注入
+        3. 参数黑名单拦截执行类 / 改配置类开关（如 fd -x、es -save）
+        4. 固定超时 + 输出行数/字符数截断，防止拖死界面或灌爆上下文
+
+        :param kind: "fd" 或 "es"
+        :param args: 空格分隔的命令行参数字符串（不含可执行文件本身）
+        :param path: 可选，限定搜索根目录，必须是已存在的目录
+        :return: {"success", "output", "truncated", "error"}
+        """
+        kind = (kind or "").lower()
+        if kind not in ("fd", "es"):
+            return {"success": False, "error": f"未知命令类型: {kind}（仅支持 fd / es）",
+                    "output": "", "truncated": False}
+
+        exe = self._fd_path if kind == "fd" else self._es_cli_path
+        if not exe or not os.path.isfile(exe):
+            return {"success": False,
+                    "error": f"{kind} 可执行文件不可用: {exe or '(未解析)'}",
+                    "output": "", "truncated": False}
+
+        # posix=False 保留 Windows 反斜杠路径，随后手工去掉包裹引号
+        try:
+            tokens = shlex.split(args or "", posix=False)
+        except ValueError as e:
+            return {"success": False, "error": f"参数解析失败: {e}",
+                    "output": "", "truncated": False}
+
+        cleaned = []
+        for tok in tokens:
+            if len(tok) >= 2 and tok[0] == tok[-1] and tok[0] in "\"'":
+                tok = tok[1:-1]
+            if tok:
+                cleaned.append(tok)
+        if not cleaned:
+            return {"success": False, "error": "参数为空", "output": "", "truncated": False}
+
+        if kind == "fd":
+            blocked_long, blocked_short = self._FD_BLOCKED_LONG, self._FD_BLOCKED_SHORT_PREFIX
+        else:
+            blocked_long, blocked_short = self._ES_BLOCKED_LONG, self._ES_BLOCKED_SHORT_PREFIX
+
+        for tok in cleaned:
+            if self._is_blocked_arg(tok, blocked_long, blocked_short):
+                return {"success": False, "error": f"参数被安全策略拒绝: {tok}",
+                        "output": "", "truncated": False}
+
+        # 结果数上限前置，尊重调用方的显式写法（后写覆盖）
+        if kind == "fd":
+            cleaned = ["--max-results", str(self._RAW_MAX_LINES),
+                       "--hidden", "--no-ignore"] + cleaned
+        else:
+            cleaned = ["-n", str(self._RAW_MAX_LINES)] + cleaned
+
+        if path:
+            root = path.strip().strip('"').rstrip("\\/")
+            if not root or not os.path.isdir(root):
+                return {"success": False, "error": f"搜索目录不存在: {path}",
+                        "output": "", "truncated": False}
+            if kind == "fd":
+                # fd 的位置参数是 [PATTERN] [PATH...] 顺序，用 --search-path 显式指定根目录，
+                # 避免"没传 PATTERN 时根目录被误当成搜索模式"
+                cleaned += ["--search-path", root]
+            else:
+                # es.exe 的位置参数是搜索词，把根目录作为路径查询词前置（Everything 路径匹配语义）
+                cleaned = [root] + cleaned
+
+        try:
+            proc = subprocess.run(
+                [exe] + cleaned,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=self._RAW_CMD_TIMEOUT,
+                creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0x08000000,
+            )
+        except subprocess.TimeoutExpired:
+            return {"success": False,
+                    "error": f"{kind} 命令超时（{self._RAW_CMD_TIMEOUT} 秒）",
+                    "output": "", "truncated": False}
+        except FileNotFoundError:
+            return {"success": False, "error": f"{kind} 未找到: {exe}",
+                    "output": "", "truncated": False}
+        except Exception as e:
+            return {"success": False, "error": f"{kind} 命令异常: {e}",
+                    "output": "", "truncated": False}
+
+        output = proc.stdout or ""
+        truncated = False
+        if len(output) > self._RAW_MAX_CHARS:
+            output, truncated = output[:self._RAW_MAX_CHARS], True
+        lines = output.splitlines()
+        if len(lines) > self._RAW_MAX_LINES:
+            lines, truncated = lines[:self._RAW_MAX_LINES], True
+        output = "\n".join(lines)
+        stderr = (proc.stderr or "").strip()[:2000]
+
+        # fd 以退出码 1 表示无匹配，属正常情况
+        failed = proc.returncode not in (0, 1) if kind == "fd" else proc.returncode != 0
+        if failed:
+            return {"success": False,
+                    "error": stderr or f"{kind} 返回错误代码 {proc.returncode}",
+                    "output": output, "results": [], "total": 0, "truncated": truncated}
+
+        results = self._parse_path_lines(output)
+        if not output.strip() or output.strip() == "(无匹配结果)":
+            return {"success": True, "output": "(无匹配结果)", "results": [],
+                    "total": 0, "truncated": False, "error": stderr}
+        return {"success": True, "output": output, "results": results,
+                "total": len(results), "truncated": truncated, "error": stderr}
+
+    @staticmethod
+    def _parse_path_lines(output: str) -> list:
+        """把命令行工具输出的"每行一个路径"解析为统一的结果结构"""
+        results = []
+        for line in (output or "").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            full_path = line
+            name = os.path.basename(full_path)
+            path = os.path.dirname(full_path)
+            _, ext = os.path.splitext(name)
+            is_folder = os.path.isdir(full_path) if os.path.exists(full_path) else False
+            size_str = ""
+            modified_str = ""
+            try:
+                if os.path.exists(full_path):
+                    stat = os.stat(full_path)
+                    size_str = EverythingSearch._format_size(stat.st_size)
+                    modified_str = datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+            except (OSError, PermissionError):
+                pass
+            results.append({
+                "name": name,
+                "path": path,
+                "full_path": full_path,
+                "extension": ext.lstrip(".").lower(),
+                "size": size_str,
+                "date_modified": modified_str,
+                "date_created": "",
+                "is_folder": is_folder
+            })
+        return results
 
     def _build_fd_args(self, query: str, max_results: int) -> list:
         """

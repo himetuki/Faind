@@ -9,6 +9,7 @@ Faind 结合 Everything SDK / [fd](https://github.com/sharkdp/fd) 的极速文�
 - **自然语言搜索** — 输入"上周在E盘修改的MD文件"，AI 自动解析为搜索查询
 - **多后端搜索** — 自动选择最优引擎：Everything SDK（DLL 直连）> fd CLI > ES CLI，支持热切换
 - **智能查询转换** — Everything 语法无损转换为 fd 参数（日期`dm:` → `--changed-within`，大小`size:` → `--size`，路径排除`!path:` → `-E`）
+- **AI 命令行工具** — 复杂查询可调用 fd / ES CLI 原生命令（正则、布尔组合、Everything 特有函数如 `regex:`/`dupe:`），只读执行并带参数黑名单、超时与输出截断护栏
 - **路径优先搜索** — 搜索时优先匹配路径/文件夹名，搜索范围智能限定（"在E盘" → 仅搜 E:\）
 - **文件标签系统** — 基于 SQLite 的标签管理
 - **深色/浅色主题** — 一键切换，设置自动持久化
